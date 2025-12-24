@@ -1,0 +1,1 @@
+"""FreeCAD geodesic dome package."""

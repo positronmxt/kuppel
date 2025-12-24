@@ -1,0 +1,378 @@
+"""Preview strut bevel cuts by actually applying the stored cut planes to geometry.
+
+What it does:
+- Select one or more `Strut_*` (Arch Structure) or `Strut_*_Geom` objects.
+- For each strut, it takes the current solid shape and applies intersection cuts using the
+  stored plane metadata (StartCut*/EndCut*/optional SideCut*).
+- Creates a new visible Part::Feature named `BevelPreview_<StrutLabel>`.
+
+Notes:
+- This does NOT modify your original struts; it creates preview copies.
+- If the preview is identical to the original, it means either:
+  - cut planes are missing, or
+  - the planes/prisms fully contain the original (no effective trimming), or
+  - the original was already cut the same way.
+"""
+
+from __future__ import annotations
+
+import math
+
+try:
+    import FreeCAD as App  # type: ignore
+    import FreeCADGui as Gui  # type: ignore
+    import Part  # type: ignore
+except Exception:
+    raise
+
+
+def _resolve_structure(doc, obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "StartCutPoint") and hasattr(obj, "StartCutNormal"):
+        return obj
+    name = getattr(obj, "Name", "")
+    if name.endswith("_Geom"):
+        candidate = doc.getObject(name[: -len("_Geom")])
+        if candidate is not None and hasattr(candidate, "StartCutPoint"):
+            return candidate
+    for parent in getattr(obj, "InList", []) or []:
+        if hasattr(parent, "StartCutPoint") and hasattr(parent, "StartCutNormal"):
+            return parent
+    return None
+
+
+def _resolve_geom(doc, structure):
+    name = getattr(structure, "Name", "")
+    geom = doc.getObject(f"{name}_Geom")
+    if geom is not None and hasattr(geom, "Shape"):
+        return geom
+    base = getattr(structure, "Base", None)
+    if base is not None and hasattr(base, "Shape"):
+        return base
+    return None
+
+
+def _is_shape_valid(shape) -> bool:
+    if shape is None:
+        return False
+    try:
+        if hasattr(shape, "isNull") and shape.isNull():
+            return False
+    except Exception:
+        return False
+    try:
+        if hasattr(shape, "isValid") and not shape.isValid():
+            return False
+    except Exception:
+        pass
+    # Prefer BoundBox validity to avoid creating shapes that can't be displayed.
+    try:
+        bb = getattr(shape, "BoundBox", None)
+        if bb is None:
+            return False
+        diag = float(getattr(bb, "DiagonalLength", 0.0))
+        if not (diag > 1e-9):
+            return False
+    except Exception:
+        return False
+    return True
+
+
+def _axis_from_structure(st, geom_shape):
+    try:
+        d = getattr(st, "StrutDirection", None)
+        if d is not None:
+            v = App.Vector(d)
+            if v.Length > 0:
+                v.normalize()
+                return v
+    except Exception:
+        pass
+
+    try:
+        bb = geom_shape.BoundBox
+        dx, dy, dz = float(bb.XLength), float(bb.YLength), float(bb.ZLength)
+        if dx >= dy and dx >= dz:
+            return App.Vector(1, 0, 0)
+        if dy >= dx and dy >= dz:
+            return App.Vector(0, 1, 0)
+        return App.Vector(0, 0, 1)
+    except Exception:
+        return App.Vector(1, 0, 0)
+
+
+def _axis_from_endpoints(start_p, end_p):
+    try:
+        v = App.Vector(end_p) - App.Vector(start_p)
+        if v.Length > 0:
+            v.normalize()
+            return v
+    except Exception:
+        pass
+    return None
+
+
+def _cut_with_plane(shape, point_vec, normal_vec, keep_vec, span, stock_hint):
+    n = App.Vector(normal_vec)
+    if n.Length == 0:
+        return shape
+    n.normalize()
+
+    # Use generous extents to avoid missing the solid when rotated.
+    width = max(float(stock_hint) * 20.0, float(span) * 2.0, 2.0)
+    height = max(float(stock_hint) * 20.0, float(span) * 2.0, 2.0)
+
+    plane = Part.makePlane(width, height)
+    rot = App.Rotation(App.Vector(0, 0, 1), n)
+    # Center plane on point; makePlane is anchored at (0,0) corner.
+    center_offset = App.Placement(App.Vector(-width / 2.0, -height / 2.0, 0), App.Rotation())
+    plane.Placement = App.Placement(App.Vector(point_vec), rot).multiply(center_offset)
+
+    direction = n if (App.Vector(keep_vec) - App.Vector(point_vec)).dot(n) >= 0 else -n
+    depth = float(span) * 6.0
+    prism = plane.extrude(direction * depth)
+
+    try:
+        result = shape.common(prism)
+    except Exception:
+        return None
+
+    if _is_shape_valid(result):
+        return result
+
+    # Retry with opposite half-space (helps if keep_vec ends up on wrong side).
+    prism2 = plane.extrude((-direction) * depth)
+    try:
+        result2 = shape.common(prism2)
+    except Exception:
+        return None
+    return result2 if _is_shape_valid(result2) else None
+
+
+def _apply_endcap_cuts(full_shape, node_point, axis_from_node, keep_point, planes, span, stock_hint):
+    axis = App.Vector(axis_from_node)
+    if axis.Length == 0:
+        return None
+    axis.normalize()
+
+    # Clamp cap length so the split plane stays inside the strut.
+    # If cap_len extends past the other end, the "keep" reference point can end up outside,
+    # and separation-plane trimming can collapse to empty.
+    try:
+        length_hint = float((App.Vector(keep_point) - App.Vector(node_point)).Length) * 2.0
+    except Exception:
+        length_hint = 0.0
+    cap_len = max(float(stock_hint) * 2.0, 0.08)
+    if length_hint > 1e-6:
+        cap_len = min(cap_len, max(0.02, length_hint * 0.45))
+
+    node_vec = App.Vector(node_point)
+    end_interior = node_vec + axis * (cap_len * 0.2)
+    split_pt = node_vec + axis * cap_len
+
+    cap = _cut_with_plane(full_shape, split_pt, axis, node_vec, span, stock_hint)
+    if cap is None:
+        return None
+    remainder = _cut_with_plane(full_shape, split_pt, axis, keep_point, span, stock_hint)
+    if remainder is None:
+        return None
+
+    cap_cut = cap
+    for plane_idx, (p, n) in enumerate(planes):
+        tmp = _cut_with_plane(cap_cut, p, n, end_interior, span, stock_hint)
+        if tmp is None:
+            # If a separation plane over-trims to empty, keep the node-plane-only cap.
+            # If the node plane itself fails (idx=0), abort.
+            if plane_idx == 0:
+                return None
+            break
+        cap_cut = tmp
+
+    try:
+        fused = remainder.fuse(cap_cut)
+        return fused if _is_shape_valid(fused) else None
+    except Exception:
+        try:
+            compound = Part.makeCompound([remainder, cap_cut])
+            return compound if _is_shape_valid(compound) else None
+        except Exception:
+            return None
+
+
+def main():
+    doc = App.ActiveDocument
+    if doc is None:
+        App.Console.PrintError("No active document\n")
+        return
+
+    sel = Gui.Selection.getSelection() if hasattr(Gui, "Selection") else []
+    if not sel:
+        App.Console.PrintError("Select one or more struts first\n")
+        return
+
+    created = 0
+    for picked in sel:
+        st = _resolve_structure(doc, picked)
+        if st is None:
+            continue
+        geom = _resolve_geom(doc, st)
+        if geom is None:
+            App.Console.PrintWarning(f"Skipping {getattr(st,'Label',st.Name)}: no geometry found\n")
+            continue
+
+        shape = getattr(geom, "Shape", None)
+        if shape is None:
+            continue
+        if not _is_shape_valid(shape):
+            App.Console.PrintWarning(f"Skipping {getattr(st,'Label',st.Name)}: invalid base shape\n")
+            continue
+
+        # Keep point = strut midpoint
+        bbox = getattr(shape, "BoundBox", None)
+        keep = App.Vector(0, 0, 0)
+        span = 1.0
+        if bbox is not None:
+            keep = App.Vector(bbox.Center)
+            try:
+                span = float(bbox.DiagonalLength) * 1.5
+            except Exception:
+                span = 1.0
+        span = max(span, 10.0)
+
+        # stock size hint for plane size
+        stock_hint = 0.25
+        for attr in ("Width", "Height"):
+            try:
+                v = float(getattr(st, attr))
+                stock_hint = max(stock_hint, v)
+            except Exception:
+                pass
+
+        # If bevel metadata missing, warn.
+        if not (hasattr(st, "StartCutPoint") and hasattr(st, "StartCutNormal") and hasattr(st, "EndCutPoint") and hasattr(st, "EndCutNormal")):
+            App.Console.PrintWarning(f"{getattr(st,'Label',st.Name)}: missing cut plane metadata (regen dome)\n")
+            continue
+
+        start_p = App.Vector(st.StartCutPoint)
+        start_n = App.Vector(st.StartCutNormal)
+        end_p = App.Vector(st.EndCutPoint)
+        end_n = App.Vector(st.EndCutNormal)
+
+        # Prefer the true strut axis derived from the stored endpoint points.
+        # This avoids bbox-based axis guesses that can flip the cap split direction.
+        axis = _axis_from_endpoints(start_p, end_p) or _axis_from_structure(st, shape)
+
+        start_planes = [(start_p, start_n)]
+        for idx in (1, 2):
+            p_attr = f"StartSep{idx}Point"
+            n_attr = f"StartSep{idx}Normal"
+            if hasattr(st, p_attr) and hasattr(st, n_attr):
+                try:
+                    p = App.Vector(getattr(st, p_attr))
+                    n = App.Vector(getattr(st, n_attr))
+                    if n.Length > 0:
+                        start_planes.append((p, n))
+                except Exception:
+                    pass
+
+        end_planes = [(end_p, end_n)]
+        for idx in (1, 2):
+            p_attr = f"EndSep{idx}Point"
+            n_attr = f"EndSep{idx}Normal"
+            if hasattr(st, p_attr) and hasattr(st, n_attr):
+                try:
+                    p = App.Vector(getattr(st, p_attr))
+                    n = App.Vector(getattr(st, n_attr))
+                    if n.Length > 0:
+                        end_planes.append((p, n))
+                except Exception:
+                    pass
+
+        result = shape
+
+        # Try full node+separation trimming first; if it collapses, retry with node plane only.
+        result = _apply_endcap_cuts(result, start_p, axis, keep, start_planes, span, stock_hint)
+        if result is None and len(start_planes) > 1:
+            result = _apply_endcap_cuts(result, start_p, axis, keep, start_planes[:1], span, stock_hint)
+        if result is None:
+            App.Console.PrintWarning(
+                f"{getattr(st,'Label',st.Name)}: start end-cap cuts produced empty result (node plane also failed; check normals)\n"
+            )
+            continue
+
+        result = _apply_endcap_cuts(result, end_p, -axis, keep, end_planes, span, stock_hint)
+        if result is None and len(end_planes) > 1:
+            result = _apply_endcap_cuts(result, end_p, -axis, keep, end_planes[:1], span, stock_hint)
+        if result is None:
+            App.Console.PrintWarning(
+                f"{getattr(st,'Label',st.Name)}: end end-cap cuts produced empty result (node plane also failed; check normals)\n"
+            )
+            continue
+
+        if hasattr(st, "SideCutPoint") and hasattr(st, "SideCutNormal"):
+            try:
+                side_n = App.Vector(st.SideCutNormal)
+                if side_n.Length > 0:
+                    side_p = App.Vector(st.SideCutPoint)
+                    result2 = _cut_with_plane(result, side_p, side_n, keep, span, stock_hint)
+                    if result2 is not None:
+                        result = result2
+            except Exception:
+                pass
+
+        # Longitudinal outer split cuts (panel seating).
+        for idx in (1, 2):
+            p_attr = f"OuterCut{idx}Point"
+            n_attr = f"OuterCut{idx}Normal"
+            if hasattr(st, p_attr) and hasattr(st, n_attr):
+                try:
+                    p = App.Vector(getattr(st, p_attr))
+                    n = App.Vector(getattr(st, n_attr))
+                    if n.Length > 0:
+                        result2 = _cut_with_plane(result, p, n, keep, span, stock_hint)
+                        if result2 is not None:
+                            result = result2
+                except Exception:
+                    pass
+
+        if not _is_shape_valid(result):
+            App.Console.PrintWarning(f"{getattr(st,'Label',st.Name)}: preview result invalid/empty; not creating object\n")
+            continue
+
+        label = getattr(st, "Label", getattr(st, "Name", "Strut"))
+        out = doc.addObject("Part::Feature", f"BevelPreview_{st.Name}")
+        out.Label = f"BevelPreview_{label}"
+        out.Shape = result
+
+        vo = getattr(out, "ViewObject", None)
+        if vo is not None:
+            try:
+                vo.ShapeColor = (1.0, 0.0, 1.0)
+            except Exception:
+                pass
+            try:
+                vo.Transparency = 0
+            except Exception:
+                pass
+
+        # Report whether generator claimed bevel.
+        try:
+            if hasattr(st, "BevelUsed") and not bool(st.BevelUsed):
+                reason = getattr(st, "BevelFailureReason", "")
+                App.Console.PrintWarning(f"{label}: generator BevelUsed=False ({reason})\n")
+        except Exception:
+            pass
+
+        created += 1
+
+    doc.recompute()
+    try:
+        Gui.activeDocument().activeView().fitAll()
+    except Exception:
+        pass
+
+    App.Console.PrintMessage(f"Created {created} preview solids (BevelPreview_*)\n")
+
+
+main()

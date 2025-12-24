@@ -1,0 +1,199 @@
+"""Generate dome (FreeCAD GUI macro, repo-pinned, automatic).
+
+Intentionally uniquely named to avoid clashing with other macros.
+
+Automatic behavior (no startup questions):
+- repo_root: inferred from this macro's location (repo_root/macros/..)
+- config: defaults to repo_root/configs/base.json
+- out_dir: defaults to repo_root/exports
+
+Optional env overrides:
+- DOME_CONFIG: path to config json
+- DOME_OUT_DIR: output directory
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import traceback
+import importlib.util
+from pathlib import Path
+
+try:
+    import FreeCAD  # type: ignore
+    import FreeCADGui  # type: ignore
+    from PySide import QtWidgets
+except Exception as exc:
+    raise SystemExit(f"This macro must be run inside FreeCAD GUI. Error: {exc}")
+
+
+def _default_repo_root() -> Path:
+    macro_path = Path(globals().get("__file__", "")).resolve()
+    if macro_path.is_file():
+        return macro_path.parents[1]
+    return Path.cwd()
+
+
+def _resolve_under(root: Path, maybe_relative: str) -> Path:
+    text = (maybe_relative or "").strip()
+    if not text:
+        return Path("")
+    p = Path(text)
+    if p.is_absolute():
+        return p
+    return (root / p).resolve()
+
+
+def _purge_cached_modules() -> None:
+    for key in list(sys.modules.keys()):
+        if key == "scripts" or key.startswith("scripts.") or key == "freecad_dome" or key.startswith("freecad_dome."):
+            sys.modules.pop(key, None)
+
+
+def main() -> None:
+    repo_root = _default_repo_root().resolve()
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    config_env = os.environ.get("DOME_CONFIG")
+    out_dir_env = os.environ.get("DOME_OUT_DIR")
+
+    config_path = (
+        Path(config_env).expanduser().resolve()
+        if config_env
+        else _resolve_under(repo_root, "configs/base.json")
+    )
+    out_dir = (
+        Path(out_dir_env).expanduser().resolve()
+        if out_dir_env
+        else _resolve_under(repo_root, "exports")
+    )
+
+    entry_path = (repo_root / "scripts" / "generate_dome.py").resolve()
+    if not entry_path.exists():
+        QtWidgets.QMessageBox.critical(None, "Generate dome", f"Missing entrypoint:\n{entry_path}")
+        return
+
+    # One-line confirmation in the report view / console.
+    try:
+        FreeCAD.Console.PrintMessage(
+            "[GenerateDomeFromRepo] "
+            f"entrypoint={entry_path} config={config_path} out_dir={out_dir}\n"
+        )
+    except Exception:
+        pass
+
+    old_argv = list(sys.argv)
+    old_cwd = os.getcwd()
+
+    try:
+        os.chdir(str(repo_root))
+        _purge_cached_modules()
+
+        sys.argv = [
+            "generate_dome.py",
+            "--config",
+            str(config_path),
+            "--out-dir",
+            str(out_dir),
+        ]
+
+        spec = importlib.util.spec_from_file_location("geodesic_generate_dome", str(entry_path))
+        if spec is None or spec.loader is None:
+            QtWidgets.QMessageBox.critical(None, "Generate dome", f"Could not load:\n{entry_path}")
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        # Run once.
+        module.main()
+
+        # Ensure the generated document is active/visible in the GUI.
+        doc = FreeCAD.ActiveDocument
+        if doc is None:
+            try:
+                doc = FreeCAD.getDocument("GeodesicDome")
+            except Exception:
+                doc = None
+        if doc is not None:
+            try:
+                FreeCAD.setActiveDocument(doc.Name)
+            except Exception:
+                pass
+            try:
+                FreeCADGui.setActiveDocument(doc.Name)
+            except Exception:
+                pass
+            try:
+                FreeCADGui.activateDocument(doc.Name)
+            except Exception:
+                pass
+        if doc is not None:
+            try:
+                doc.recompute()
+            except Exception:
+                pass
+            # Keep the 3D view responsive: do NOT unhide everything.
+            # Show only the actual model parts (Arch struts + panels/glass) and keep
+            # helper geometry hidden.
+            try:
+                objs = list(getattr(doc, "Objects", []) or [])
+                for obj in objs:
+                    vo = getattr(obj, "ViewObject", None)
+                    if vo is None or not hasattr(vo, "Visibility"):
+                        continue
+
+                    name = str(getattr(obj, "Name", "") or "")
+                    label = str(getattr(obj, "Label", "") or "")
+                    raw = name or label
+
+                    # Always hide helper solids/groups.
+                    if raw.endswith("_Geom") or raw == "StrutHelperGeometry":
+                        vo.Visibility = False
+                        continue
+
+                    # Avoid forcing TechDraw pages/views visible in 3D.
+                    try:
+                        tid = str(getattr(obj, "TypeId", "") or "")
+                    except Exception:
+                        tid = ""
+                    if tid.startswith("TechDraw::"):
+                        continue
+
+                    # Show actual model objects.
+                    if hasattr(obj, "IfcType") or raw.startswith("PanelFrame_") or raw.startswith("GlassPanel_") or raw.startswith("Panel_"):
+                        vo.Visibility = True
+            except Exception:
+                pass
+            try:
+                view = FreeCADGui.ActiveDocument.ActiveView
+                view.viewAxonometric()
+                view.fitAll()
+            except Exception:
+                pass
+            obj_count = len(getattr(doc, "Objects", []) or [])
+            QtWidgets.QMessageBox.information(
+                None,
+                "Generate dome",
+                f"Done.\n\nDocument: {doc.Name}\nObjects: {obj_count}\n\nOutputs in:\n{out_dir}",
+            )
+        else:
+            QtWidgets.QMessageBox.information(None, "Generate dome", f"Done. Outputs in:\n{out_dir}")
+
+    except SystemExit as exc:
+        code = getattr(exc, "code", None)
+        QtWidgets.QMessageBox.information(None, "Generate dome", f"Canceled/Exited (code={code}).")
+    except BaseException:
+        err = traceback.format_exc()
+        QtWidgets.QMessageBox.critical(None, "Generate dome failed", err)
+        raise
+    finally:
+        sys.argv = old_argv
+        try:
+            os.chdir(old_cwd)
+        except Exception:
+            pass
+
+
+main()

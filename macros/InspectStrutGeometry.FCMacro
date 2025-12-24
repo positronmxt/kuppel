@@ -1,0 +1,196 @@
+"""Inspect a strut's geometry and stored cut-plane metadata.
+
+Usage:
+- Select a `Strut_*` object (Arch Structure) in the tree, then run this macro.
+- If nothing is selected, it will try to find a strut by label TARGET_LABEL.
+
+It prints:
+- Base shape stats (volume, bbox)
+- StrutDirection
+- Start/End node planes (StartCut*/EndCut*)
+- Start/End separation planes (StartSep*/EndSep*)
+- Optional SideCut plane
+- Angles between axis and the node-plane normals
+
+This helps debug whether a particular strut (e.g. Strut_L11_001) is being cut
+in the intended half-spaces.
+"""
+
+from __future__ import annotations
+
+import math
+
+try:
+    import FreeCAD as App  # type: ignore
+    import FreeCADGui as Gui  # type: ignore
+except Exception:
+    raise
+
+
+TARGET_LABEL = "Strut_L11_001"
+
+
+def _deg(rad: float) -> float:
+    return rad * 180.0 / math.pi
+
+
+def _vec(v) -> "App.Vector":
+    return App.Vector(v)
+
+
+def _angle(a: "App.Vector", b: "App.Vector") -> float:
+    a = App.Vector(a)
+    b = App.Vector(b)
+    if a.Length == 0 or b.Length == 0:
+        return float("nan")
+    return _deg(a.getAngle(b))
+
+
+def _resolve_structure(doc, obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "StartCutPoint") and hasattr(obj, "StartCutNormal"):
+        return obj
+    name = getattr(obj, "Name", "")
+    if name.endswith("_Geom"):
+        candidate = doc.getObject(name[: -len("_Geom")])
+        if candidate is not None and hasattr(candidate, "StartCutPoint"):
+            return candidate
+    for parent in getattr(obj, "InList", []) or []:
+        if hasattr(parent, "StartCutPoint") and hasattr(parent, "StartCutNormal"):
+            return parent
+    return None
+
+
+def _resolve_geom(doc, structure):
+    name = getattr(structure, "Name", "")
+    geom = doc.getObject(f"{name}_Geom")
+    if geom is not None and hasattr(geom, "Shape"):
+        return geom
+    base = getattr(structure, "Base", None)
+    if base is not None and hasattr(base, "Shape"):
+        return base
+    return None
+
+
+def _find_by_label(doc, label: str):
+    for obj in getattr(doc, "Objects", []) or []:
+        if getattr(obj, "Label", "") == label:
+            return obj
+    for obj in getattr(doc, "Objects", []) or []:
+        if getattr(obj, "Name", "") == label:
+            return obj
+    return None
+
+
+def _print_plane(tag: str, p, n, axis=None, radial=None):
+    pv = _vec(p)
+    nv = _vec(n)
+    msg = f"{tag}: P=({pv.x:.4f},{pv.y:.4f},{pv.z:.4f}) N=({nv.x:.4f},{nv.y:.4f},{nv.z:.4f})"
+    if axis is not None:
+        msg += f"  angle(N,axis)={_angle(nv, axis):.2f}deg"
+    if radial is not None:
+        msg += f"  angle(N,radial)={_angle(nv, radial):.2f}deg"
+    App.Console.PrintMessage(msg + "\n")
+
+
+def main():
+    doc = App.ActiveDocument
+    if doc is None:
+        App.Console.PrintError("No active document\n")
+        return
+
+    sel = Gui.Selection.getSelection() if hasattr(Gui, "Selection") else []
+    picked = sel[0] if sel else _find_by_label(doc, TARGET_LABEL)
+    if picked is None:
+        App.Console.PrintError(f"Select a strut or ensure {TARGET_LABEL} exists\n")
+        return
+
+    st = _resolve_structure(doc, picked)
+    if st is None:
+        App.Console.PrintError("Selection is not a Strut_* structure (missing StartCut*)\n")
+        return
+
+    geom = _resolve_geom(doc, st)
+    if geom is None:
+        App.Console.PrintError("Could not find base geometry (*_Geom or Base)\n")
+        return
+
+    label = getattr(st, "Label", st.Name)
+    App.Console.PrintMessage(f"=== Inspect {label} ({st.Name}) ===\n")
+
+    # Shape stats
+    shape = getattr(geom, "Shape", None)
+    if shape is None:
+        App.Console.PrintError("No Shape\n")
+        return
+
+    bb = getattr(shape, "BoundBox", None)
+    if bb is not None:
+        App.Console.PrintMessage(
+            f"Shape bbox diag={float(getattr(bb,'DiagonalLength',0.0)):.6f} center=({bb.Center.x:.4f},{bb.Center.y:.4f},{bb.Center.z:.4f})\n"
+        )
+    try:
+        App.Console.PrintMessage(f"Shape volume={float(getattr(shape,'Volume',0.0)):.9f}\n")
+    except Exception:
+        pass
+
+    # Axis
+    axis = None
+    try:
+        axis = _vec(getattr(st, "StrutDirection"))
+        if axis.Length > 0:
+            axis.normalize()
+    except Exception:
+        axis = None
+    if axis is None or axis.Length == 0:
+        App.Console.PrintWarning("No StrutDirection found/valid\n")
+        axis = App.Vector(1, 0, 0)
+
+    # Radial at start (approx)
+    radial = None
+    try:
+        sp = _vec(getattr(st, "StartCutPoint"))
+        radial = App.Vector(sp)
+        if radial.Length > 0:
+            radial.normalize()
+    except Exception:
+        radial = None
+
+    # Bevel flags
+    try:
+        used = bool(getattr(st, "BevelUsed", False))
+        reason = str(getattr(st, "BevelFailureReason", ""))
+        App.Console.PrintMessage(f"BevelUsed={used} reason='{reason}'\n")
+    except Exception:
+        pass
+
+    # Node planes
+    _print_plane("START", getattr(st, "StartCutPoint"), getattr(st, "StartCutNormal"), axis=axis, radial=radial)
+    _print_plane("END", getattr(st, "EndCutPoint"), getattr(st, "EndCutNormal"), axis=-axis, radial=radial)
+
+    # Separation planes
+    for idx in (1, 2):
+        p_attr = f"StartSep{idx}Point"
+        n_attr = f"StartSep{idx}Normal"
+        if hasattr(st, p_attr) and hasattr(st, n_attr):
+            _print_plane(f"START_SEP{idx}", getattr(st, p_attr), getattr(st, n_attr), axis=axis, radial=radial)
+    for idx in (1, 2):
+        p_attr = f"EndSep{idx}Point"
+        n_attr = f"EndSep{idx}Normal"
+        if hasattr(st, p_attr) and hasattr(st, n_attr):
+            _print_plane(f"END_SEP{idx}", getattr(st, p_attr), getattr(st, n_attr), axis=-axis, radial=radial)
+
+    # Optional side cut
+    if hasattr(st, "SideCutPoint") and hasattr(st, "SideCutNormal"):
+        try:
+            sn = _vec(getattr(st, "SideCutNormal"))
+            if sn.Length > 0:
+                _print_plane("SIDE", getattr(st, "SideCutPoint"), getattr(st, "SideCutNormal"), axis=axis, radial=radial)
+        except Exception:
+            pass
+
+    App.Console.PrintMessage("=== Done ===\n")
+
+
+main()

@@ -1,0 +1,212 @@
+"""Joint Variant Batch Export (FreeCAD GUI macro)
+
+Opens a native FreeCAD/Qt dialog to run:
+  scripts/export_joint_variant_batch.py::run_batch
+
+Install/Run:
+- FreeCAD -> Macro -> Macros... -> Add -> select this file
+- Execute macro
+
+Notes:
+- Requires FreeCAD GUI (FreeCADGui) and PySide.
+- Exports are written by the existing pure-Python pipeline (no Part/booleans).
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import threading
+import traceback
+from pathlib import Path
+
+try:
+    import FreeCADGui  # noqa: F401
+    from PySide import QtCore, QtWidgets
+except Exception as exc:
+    raise SystemExit(f"This macro must be run inside FreeCAD GUI. Error: {exc}")
+
+
+def _repo_root_from_macro_path() -> Path:
+    # In FreeCAD macros, __file__ is typically available.
+    macro_path = Path(globals().get("__file__", "")).resolve()
+    if macro_path.is_file():
+        # macros/<name>.FCMacro -> repo root is parent of 'macros'
+        return macro_path.parents[1]
+    # Fallback: try current working directory.
+    return Path.cwd()
+
+
+def _resolve_under(root: Path, maybe_relative: str) -> str:
+    p = Path(maybe_relative.strip())
+    if not maybe_relative.strip():
+        return str(p)
+    if p.is_absolute():
+        return str(p)
+    return str((root / p).resolve())
+
+
+class JointVariantBatchDialog(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Joint Variant Batch Export")
+        self.setMinimumWidth(720)
+
+        repo_root = _repo_root_from_macro_path()
+
+        self.repo_root_edit = QtWidgets.QLineEdit(str(repo_root))
+        self.repo_root_edit.setToolTip("Repository root (used for imports and resolving relative paths)")
+
+        self.config_edit = QtWidgets.QLineEdit("configs/base.json")
+        self.out_dir_edit = QtWidgets.QLineEdit("exports/panel_frame_cutplanes")
+
+        self.q_edit = QtWidgets.QLineEdit("0.95")
+        self.tol_edit = QtWidgets.QLineEdit("1e-5")
+        self.max_iter_edit = QtWidgets.QLineEdit("40")
+        self.also_hub_points = QtWidgets.QCheckBox("Also export node-hub points")
+        self.also_hub_points.setChecked(False)
+
+        self.log = QtWidgets.QPlainTextEdit()
+        self.log.setReadOnly(True)
+        self.log.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+
+        browse_cfg = QtWidgets.QPushButton("Browse")
+        browse_out = QtWidgets.QPushButton("Browse")
+        browse_root = QtWidgets.QPushButton("Browse")
+        run_btn = QtWidgets.QPushButton("Run")
+        close_btn = QtWidgets.QPushButton("Close")
+
+        browse_cfg.clicked.connect(self._browse_config)
+        browse_out.clicked.connect(self._browse_out_dir)
+        browse_root.clicked.connect(self._browse_repo_root)
+        run_btn.clicked.connect(self._run)
+        close_btn.clicked.connect(self.close)
+
+        form = QtWidgets.QFormLayout()
+
+        root_row = QtWidgets.QHBoxLayout()
+        root_row.addWidget(self.repo_root_edit, 1)
+        root_row.addWidget(browse_root)
+        form.addRow("Repo root", root_row)
+
+        cfg_row = QtWidgets.QHBoxLayout()
+        cfg_row.addWidget(self.config_edit, 1)
+        cfg_row.addWidget(browse_cfg)
+        form.addRow("Config", cfg_row)
+
+        out_row = QtWidgets.QHBoxLayout()
+        out_row.addWidget(self.out_dir_edit, 1)
+        out_row.addWidget(browse_out)
+        form.addRow("Out dir", out_row)
+
+        form.addRow("Quantile q", self.q_edit)
+        form.addRow("Tolerance (m)", self.tol_edit)
+        form.addRow("Max iter", self.max_iter_edit)
+        form.addRow("", self.also_hub_points)
+
+        btns = QtWidgets.QHBoxLayout()
+        btns.addStretch(1)
+        btns.addWidget(run_btn)
+        btns.addWidget(close_btn)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.addLayout(form)
+        layout.addWidget(self.log, 1)
+        layout.addLayout(btns)
+
+        self._set_log("Ready.\n")
+
+    def _set_log(self, text: str) -> None:
+        self.log.setPlainText(text)
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def _append_log(self, text: str) -> None:
+        self.log.appendPlainText(text)
+        self.log.verticalScrollBar().setValue(self.log.verticalScrollBar().maximum())
+
+    def _browse_config(self) -> None:
+        path, _ = QtWidgets.QFileDialog.getOpenFileName(
+            self,
+            "Select config JSON",
+            self.repo_root_edit.text().strip() or str(Path.cwd()),
+            "JSON (*.json);;All Files (*)",
+        )
+        if path:
+            self.config_edit.setText(path)
+
+    def _browse_repo_root(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select repository root",
+            self.repo_root_edit.text().strip() or str(Path.cwd()),
+        )
+        if path:
+            self.repo_root_edit.setText(path)
+
+    def _browse_out_dir(self) -> None:
+        path = QtWidgets.QFileDialog.getExistingDirectory(
+            self,
+            "Select output directory",
+            self.repo_root_edit.text().strip() or str(Path.cwd()),
+        )
+        if path:
+            self.out_dir_edit.setText(path)
+
+    def _run(self) -> None:
+        self._set_log("Running...\n")
+
+        repo_root = Path(self.repo_root_edit.text().strip() or Path.cwd()).resolve()
+        config = _resolve_under(repo_root, self.config_edit.text())
+        out_dir = _resolve_under(repo_root, self.out_dir_edit.text())
+
+        try:
+            q = float(self.q_edit.text().strip())
+            tol = float(self.tol_edit.text().strip())
+            max_iter = int(float(self.max_iter_edit.text().strip()))
+        except Exception:
+            QtWidgets.QMessageBox.critical(self, "Invalid input", "q/tol/max_iter must be numbers")
+            return
+
+        also_hub = bool(self.also_hub_points.isChecked())
+
+        def work() -> None:
+            try:
+                if str(repo_root) not in sys.path:
+                    sys.path.insert(0, str(repo_root))
+
+                from scripts.export_joint_variant_batch import run_batch
+
+                # Make relative file I/O predictable.
+                os.chdir(str(repo_root))
+
+                manifest_path = run_batch(
+                    config=config,
+                    out_dir=out_dir,
+                    q=q,
+                    tol=tol,
+                    max_iter=max_iter,
+                    also_node_hub_points=also_hub,
+                )
+
+                def done_ok() -> None:
+                    self._set_log(f"OK\nmanifest={manifest_path}\n")
+
+                QtCore.QTimer.singleShot(0, done_ok)
+            except Exception:
+                err = traceback.format_exc()
+
+                def done_err() -> None:
+                    self._set_log(err)
+                    QtWidgets.QMessageBox.critical(self, "Batch export failed", err)
+
+                QtCore.QTimer.singleShot(0, done_err)
+
+        threading.Thread(target=work, daemon=True).start()
+
+
+def main() -> None:
+    dlg = JointVariantBatchDialog()
+    dlg.exec_()
+
+
+main()

@@ -1,0 +1,12 @@
+{
+  "radius_m": 3.0,
+  "frequency": 3,
+  "truncation_ratio": 0.18,
+  "hemisphere_ratio": 0.625,
+  "stock_width_m": 0.05,
+  "stock_height_m": 0.05,
+  "kerf_m": 0.002,
+  "clearance_m": 0.003,
+  "material": "wood",
+  "use_bevels": false
+}

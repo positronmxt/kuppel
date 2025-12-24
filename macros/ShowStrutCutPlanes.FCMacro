@@ -1,0 +1,210 @@
+"""Show beveled strut cut planes for selected struts.
+
+Usage in FreeCAD:
+- Select one or more strut objects (Arch Structure) in the tree or 3D view.
+- Run this macro.
+
+It reads the stored properties written by freecad_dome/struts.py:
+  StartCutPoint/StartCutNormal, EndCutPoint/EndCutNormal, optional SideCutPoint/SideCutNormal.
+
+Then it creates visible plane features under a "StrutCutPlanes" group.
+
+It also shows optional longitudinal outer split planes:
+    OuterCut1Point/OuterCut1Normal, OuterCut2Point/OuterCut2Normal.
+"""
+
+from __future__ import annotations
+
+import math
+
+try:
+    import FreeCAD as App  # type: ignore
+    import FreeCADGui as Gui  # type: ignore
+    import Part  # type: ignore
+except Exception as exc:  # pragma: no cover
+    raise
+
+
+# Display size for helper planes (meters). 0.30 = 30cm.
+PLANE_SIZE_M = 0.30
+
+
+def _rotation_from_z_to(normal: "App.Vector"):
+    z = App.Vector(0, 0, 1)
+    n = App.Vector(normal)
+    if n.Length == 0:
+        n = App.Vector(0, 0, 1)
+    n.normalize()
+    try:
+        return App.Rotation(z, n)
+    except Exception:
+        # Fallback: angle/axis
+        axis = z.cross(n)
+        if axis.Length == 0:
+            return App.Rotation()
+        axis.normalize()
+        angle = z.getAngle(n) * 180.0 / math.pi
+        return App.Rotation(axis, angle)
+
+
+def _ensure_group(doc, name: str):
+    grp = doc.getObject(name)
+    if grp is None:
+        grp = doc.addObject("App::DocumentObjectGroup", name)
+        grp.Label = name
+    return grp
+
+
+def _make_plane(doc, label: str, point: "App.Vector", normal: "App.Vector", size: float, color):
+    face = Part.makePlane(size, size)
+    rot = _rotation_from_z_to(normal)
+    face.Placement = App.Placement(point, rot)
+
+    obj = doc.addObject("Part::Feature", label)
+    obj.Label = label
+    obj.Shape = face
+
+    vo = getattr(obj, "ViewObject", None)
+    if vo is not None:
+        try:
+            vo.ShapeColor = color
+        except Exception:
+            pass
+        try:
+            vo.Transparency = 75
+        except Exception:
+            pass
+        try:
+            vo.LineWidth = 2.0
+        except Exception:
+            pass
+    return obj
+
+
+def _resolve_structure(doc, obj):
+    if obj is None:
+        return None
+    if hasattr(obj, "StartCutPoint") and hasattr(obj, "StartCutNormal"):
+        return obj
+    name = getattr(obj, "Name", "")
+    if name.endswith("_Geom"):
+        candidate = doc.getObject(name[: -len("_Geom")])
+        if candidate is not None and hasattr(candidate, "StartCutPoint"):
+            return candidate
+    for parent in getattr(obj, "InList", []) or []:
+        if hasattr(parent, "StartCutPoint") and hasattr(parent, "StartCutNormal"):
+            return parent
+    return None
+
+
+def main():
+    doc = App.ActiveDocument
+    if doc is None:
+        App.Console.PrintError("No active document\n")
+        return
+
+    selection = Gui.Selection.getSelection() if hasattr(Gui, "Selection") else []
+    if not selection:
+        App.Console.PrintError("Select one or more struts first\n")
+        return
+
+    group = _ensure_group(doc, "StrutCutPlanes")
+
+    created = 0
+    for picked in selection:
+        st = _resolve_structure(doc, picked)
+        if st is None:
+            continue
+
+        # Heuristic plane size: based on stock width/height if present, else 0.25m.
+        size = float(PLANE_SIZE_M)
+
+        base_label = getattr(st, "Label", getattr(st, "Name", "Strut"))
+
+        if hasattr(st, "StartCutPoint") and hasattr(st, "StartCutNormal"):
+            p = App.Vector(st.StartCutPoint)
+            n = App.Vector(st.StartCutNormal)
+            obj = _make_plane(doc, f"CutPlane_{base_label}_START", p, n, size, (1.0, 0.2, 0.2))
+            group.addObject(obj)
+            created += 1
+
+        # Node-fit separation planes at start.
+        for idx, color in ((1, (1.0, 0.6, 0.2)), (2, (1.0, 0.8, 0.2))):
+            p_attr = f"StartSep{idx}Point"
+            n_attr = f"StartSep{idx}Normal"
+            if hasattr(st, p_attr) and hasattr(st, n_attr):
+                try:
+                    p = App.Vector(getattr(st, p_attr))
+                    n = App.Vector(getattr(st, n_attr))
+                    if n.Length > 0:
+                        obj = _make_plane(doc, f"CutPlane_{base_label}_START_SEP{idx}", p, n, size, color)
+                        group.addObject(obj)
+                        created += 1
+                except Exception:
+                    pass
+
+        if hasattr(st, "EndCutPoint") and hasattr(st, "EndCutNormal"):
+            p = App.Vector(st.EndCutPoint)
+            n = App.Vector(st.EndCutNormal)
+            obj = _make_plane(doc, f"CutPlane_{base_label}_END", p, n, size, (0.2, 0.2, 1.0))
+            group.addObject(obj)
+            created += 1
+
+        # Node-fit separation planes at end.
+        for idx, color in ((1, (0.2, 0.6, 1.0)), (2, (0.2, 0.8, 1.0))):
+            p_attr = f"EndSep{idx}Point"
+            n_attr = f"EndSep{idx}Normal"
+            if hasattr(st, p_attr) and hasattr(st, n_attr):
+                try:
+                    p = App.Vector(getattr(st, p_attr))
+                    n = App.Vector(getattr(st, n_attr))
+                    if n.Length > 0:
+                        obj = _make_plane(doc, f"CutPlane_{base_label}_END_SEP{idx}", p, n, size, color)
+                        group.addObject(obj)
+                        created += 1
+                except Exception:
+                    pass
+
+        if hasattr(st, "SideCutPoint") and hasattr(st, "SideCutNormal"):
+            try:
+                p = App.Vector(st.SideCutPoint)
+                n = App.Vector(st.SideCutNormal)
+                if n.Length > 0:
+                    obj = _make_plane(doc, f"CutPlane_{base_label}_SIDE", p, n, size, (0.2, 1.0, 0.2))
+                    group.addObject(obj)
+                    created += 1
+            except Exception:
+                pass
+
+        # Longitudinal outer split planes.
+        for idx, color in ((1, (0.2, 1.0, 0.6)), (2, (0.2, 1.0, 0.8))):
+            p_attr = f"OuterCut{idx}Point"
+            n_attr = f"OuterCut{idx}Normal"
+            if hasattr(st, p_attr) and hasattr(st, n_attr):
+                try:
+                    p = App.Vector(getattr(st, p_attr))
+                    n = App.Vector(getattr(st, n_attr))
+                    if n.Length > 0:
+                        obj = _make_plane(doc, f"CutPlane_{base_label}_OUTER{idx}", p, n, size, color)
+                        group.addObject(obj)
+                        created += 1
+                except Exception:
+                    pass
+
+        try:
+            if hasattr(st, "BevelUsed") and not bool(st.BevelUsed):
+                reason = getattr(st, "BevelFailureReason", "")
+                App.Console.PrintWarning(f"{base_label}: bevel not applied ({reason})\n")
+        except Exception:
+            pass
+
+    doc.recompute()
+    try:
+        Gui.activeDocument().activeView().fitAll()
+    except Exception:
+        pass
+
+    App.Console.PrintMessage(f"Created {created} cut-plane helpers under StrutCutPlanes\n")
+
+
+main()

@@ -1,0 +1,100 @@
+"""Debug TechDraw view directions (FreeCAD GUI macro).
+
+Prints Direction/XDirection/Scale for all TechDraw pages (default prefix TD_)
+into the FreeCAD Report view.
+
+Optional env overrides:
+- TD_PAGE_PREFIX: page prefix filter (default TD_)
+- TD_SHOW_PROPERTIES: 1/0
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import traceback
+import importlib.util
+from pathlib import Path
+
+try:
+    import FreeCAD  # type: ignore
+    from PySide import QtWidgets
+except Exception as exc:
+    raise SystemExit(f"This macro must be run inside FreeCAD. Error: {exc}")
+
+
+def _default_repo_root() -> Path:
+    macro_path = Path(globals().get("__file__", "")).resolve()
+    if macro_path.is_file():
+        return macro_path.parents[1]
+    return Path.cwd()
+
+
+def _purge_cached_modules() -> None:
+    for key in list(sys.modules.keys()):
+        if key == "scripts" or key.startswith("scripts.") or key == "freecad_dome" or key.startswith("freecad_dome."):
+            sys.modules.pop(key, None)
+
+
+def _truthy(text: str | None) -> bool:
+    if text is None:
+        return False
+    return str(text).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def main() -> None:
+    repo_root = _default_repo_root().resolve()
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    entry_path = (repo_root / "scripts" / "debug_techdraw_views.py").resolve()
+    if not entry_path.exists():
+        QtWidgets.QMessageBox.critical(None, "TechDraw debug", f"Missing entrypoint:\n{entry_path}")
+        return
+
+    try:
+        FreeCAD.Console.PrintMessage(f"[DebugTechDrawViews] entrypoint={entry_path}\n")
+    except Exception:
+        pass
+
+    old_argv = list(sys.argv)
+    old_cwd = os.getcwd()
+
+    try:
+        os.chdir(str(repo_root))
+        _purge_cached_modules()
+
+        prefix = os.environ.get("TD_PAGE_PREFIX", "TD_")
+        show_props = _truthy(os.environ.get("TD_SHOW_PROPERTIES"))
+
+        sys.argv = ["debug_techdraw_views.py", "--page-prefix", prefix]
+        if show_props:
+            sys.argv.append("--show-properties")
+
+        spec = importlib.util.spec_from_file_location("geodesic_debug_techdraw", str(entry_path))
+        if spec is None or spec.loader is None:
+            QtWidgets.QMessageBox.critical(None, "TechDraw debug", f"Could not load:\n{entry_path}")
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        rc = int(module.main([]))
+        if rc != 0:
+            QtWidgets.QMessageBox.warning(None, "TechDraw debug", f"Debug script returned code {rc}.")
+            return
+
+        QtWidgets.QMessageBox.information(None, "TechDraw debug", "Printed view diagnostics to the Report view.")
+
+    except BaseException:
+        err = traceback.format_exc()
+        QtWidgets.QMessageBox.critical(None, "TechDraw debug failed", err)
+        raise
+    finally:
+        sys.argv = old_argv
+        try:
+            os.chdir(old_cwd)
+        except Exception:
+            pass
+
+
+main()

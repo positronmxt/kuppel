@@ -49,8 +49,8 @@ scripts/
 
 ## Configuration layers
 
-- **JSON (primary)** — see `configs/base.json` for the canonical defaults that align with the current requirements (3m radius, V4, truncation 0.18, hemisphere 0.625, 50×50mm timber, kerf 2mm, clearance 3mm).
-- **Full icosahedron preset** — use `configs/icosahedron_full.json` to keep frequency1, disable truncation, and set the hemisphere ratio to `1.0` so the entire sphere is generated before any clipping or truncation tweaks.
+- **JSON (primary)** — see `configs/base.json` for the canonical defaults that align with the current requirements (3 m radius, V4, truncation 0.18, hemisphere 0.625, 50×50 mm timber, kerf 2 mm, clearance 3 mm).
+- **Full icosahedron preset** — use `configs/icosahedron_full.json` to keep frequency 1, disable truncation, and set the hemisphere ratio to `1.0` so the entire sphere is generated before any clipping or truncation tweaks.
 - **Testing variant** — `configs/testing_v3.json` lowers the frequency to V3 and disables bevels for lighter-weight experiments.
 - **CLI overrides** — `scripts/generate_dome.py` accepts flags such as `--radius`, `--frequency`, `--stock-size WIDTH HEIGHT`, and export controls (`--out-dir`, `--skip-ifc`, `--stl-name`...).
 - **Joint style toggles** — pass `--no-bevels` to disable beveled ends (use straight prisms) when boolean ops struggle.

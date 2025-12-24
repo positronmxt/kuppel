@@ -1,0 +1,114 @@
+"""Generate TechDraw pages for representative part groups (FreeCAD GUI macro).
+
+Creates one TechDraw page per part group, selecting a single representative object:
+- Struts: grouped by Strut_<Lxx> using hidden geometry solids Strut_<Lxx>_<seq>_Geom
+- Panel frames: grouped by shape signature (faces/edges/verts + area/volume)
+- Glass panels: grouped by shape signature
+
+Optional env overrides:
+- TD_TEMPLATE: SVG template path
+- TD_OUT_DIR: export directory
+- TD_EXPORT_PDF: 1/0
+- TD_EXPORT_DXF: 1/0
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+import traceback
+import importlib.util
+from pathlib import Path
+
+try:
+    import FreeCAD  # type: ignore
+    import FreeCADGui  # type: ignore
+    from PySide import QtWidgets
+except Exception as exc:
+    raise SystemExit(f"This macro must be run inside FreeCAD GUI. Error: {exc}")
+
+
+def _default_repo_root() -> Path:
+    macro_path = Path(globals().get("__file__", "")).resolve()
+    if macro_path.is_file():
+        return macro_path.parents[1]
+    return Path.cwd()
+
+
+def _purge_cached_modules() -> None:
+    for key in list(sys.modules.keys()):
+        if key == "scripts" or key.startswith("scripts.") or key == "freecad_dome" or key.startswith("freecad_dome."):
+            sys.modules.pop(key, None)
+
+
+def main() -> None:
+    repo_root = _default_repo_root().resolve()
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+
+    entry_path = (repo_root / "scripts" / "generate_techdraw.py").resolve()
+    if not entry_path.exists():
+        QtWidgets.QMessageBox.critical(None, "TechDraw", f"Missing entrypoint:\n{entry_path}")
+        return
+
+    try:
+        FreeCAD.Console.PrintMessage(f"[GenerateTechDrawRepresentativeParts] entrypoint={entry_path}\n")
+    except Exception:
+        pass
+
+    old_argv = list(sys.argv)
+    old_cwd = os.getcwd()
+
+    try:
+        os.chdir(str(repo_root))
+        _purge_cached_modules()
+
+        # No args by default; users can override via env vars.
+        sys.argv = ["generate_techdraw.py"]
+
+        spec = importlib.util.spec_from_file_location("geodesic_generate_techdraw", str(entry_path))
+        if spec is None or spec.loader is None:
+            QtWidgets.QMessageBox.critical(None, "TechDraw", f"Could not load:\n{entry_path}")
+            return
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+
+        rc = int(module.main([]))
+        if rc != 0:
+            QtWidgets.QMessageBox.warning(None, "TechDraw", f"TechDraw generation returned code {rc}.")
+            return
+
+        doc = FreeCAD.ActiveDocument
+        if doc is not None:
+            try:
+                doc.recompute()
+            except Exception:
+                pass
+
+        try:
+            view = FreeCADGui.ActiveDocument.ActiveView
+            view.fitAll()
+        except Exception:
+            pass
+
+        QtWidgets.QMessageBox.information(
+            None,
+            "TechDraw",
+            "Done. Created TechDraw pages for representative part groups.\n\n"
+            "Optional exports via env vars:\n"
+            "- TD_OUT_DIR\n- TD_EXPORT_PDF=1\n- TD_EXPORT_DXF=1",
+        )
+
+    except BaseException:
+        err = traceback.format_exc()
+        QtWidgets.QMessageBox.critical(None, "TechDraw failed", err)
+        raise
+    finally:
+        sys.argv = old_argv
+        try:
+            os.chdir(old_cwd)
+        except Exception:
+            pass
+
+
+main()
