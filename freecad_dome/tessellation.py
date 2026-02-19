@@ -11,6 +11,17 @@ from typing import Dict, Iterable, List, Tuple, Set
 from . import icosahedron
 from .parameters import DomeParameters
 
+__all__ = [
+    "Vector3",
+    "Edge",
+    "Face",
+    "Strut",
+    "Panel",
+    "TessellatedDome",
+    "tessellate",
+    "validate_structure",
+]
+
 Vector3 = Tuple[float, float, float]
 Edge = Tuple[int, int]
 Face = Tuple[int, int, int]
@@ -34,23 +45,17 @@ class Strut:
         x2, y2, z2 = self.end
         return ((x1 + x2) * 0.5, (y1 + y2) * 0.5, (z1 + z2) * 0.5)
 
-
-def _distance(a: Vector3, b: Vector3) -> float:
-    x1, y1, z1 = a
-    x2, y2, z2 = b
-    return sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
-
     @property
     def direction(self) -> Vector3:
         x1, y1, z1 = self.start
         x2, y2, z2 = self.end
         return (x2 - x1, y2 - y1, z2 - z1)
 
-    @property
-    def midpoint(self) -> Vector3:
-        x1, y1, z1 = self.start
-        x2, y2, z2 = self.end
-        return ((x1 + x2) * 0.5, (y1 + y2) * 0.5, (z1 + z2) * 0.5)
+
+def _distance(a: Vector3, b: Vector3) -> float:
+    x1, y1, z1 = a
+    x2, y2, z2 = b
+    return sqrt((x2 - x1) ** 2 + (y2 - y1) ** 2 + (z2 - z1) ** 2)
 
 
 @dataclass(slots=True)
@@ -97,7 +102,7 @@ def tessellate(mesh: icosahedron.IcosahedronMesh, params: DomeParameters) -> Tes
         return TessellatedDome(nodes=[], struts=[], panels=[])
 
     # Optional legacy behavior: close the bottom with a planar cap at the belt plane.
-    if params.hemisphere_ratio < 1.0 and bool(getattr(params, "generate_belt_cap", False)):
+    if params.hemisphere_ratio < 1.0 and params.generate_belt_cap:
         belt_height = params.radius_m * (1 - 2 * params.hemisphere_ratio)
         nodes, polygons = _add_planar_belt(nodes, polygons, belt_height)
 

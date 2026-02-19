@@ -11,6 +11,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
+__all__ = [
+    "TechDrawOptions",
+    "default_template_path",
+    "generate_representative_techdraw",
+    "generate_techdraw_for_dome",
+    "TechDrawResult",
+]
+
 
 @dataclass(slots=True)
 class TechDrawOptions:
@@ -732,3 +740,285 @@ def _export_page_dxf(page: Any, options: TechDrawOptions, key: str) -> str | Non
         pass
     logging.warning("DXF export not available in this FreeCAD build")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Page format templates
+# ---------------------------------------------------------------------------
+
+# Landscape dimensions in mm
+_PAGE_FORMATS: Dict[str, Tuple[float, float]] = {
+    "A2": (594.0, 420.0),
+    "A3": (420.0, 297.0),
+    "A4": (297.0, 210.0),
+}
+
+
+def template_path_for_format(page_format: str) -> str:
+    """Return best-effort template path for the given page format (A2/A3/A4)."""
+    fmt = page_format.upper() if page_format else "A3"
+    if fmt not in _PAGE_FORMATS:
+        fmt = "A3"
+
+    # Check repo templates directory first.
+    try:
+        repo_root = Path(__file__).resolve().parents[1]
+        for name in (
+            f"{fmt}_Landscape.svg",
+            f"{fmt}_LandscapeTD.svg",
+        ):
+            cand = repo_root / "techdraw_templates" / name
+            if cand.exists():
+                return str(cand)
+    except Exception:
+        pass
+
+    # FreeCAD bundled templates.
+    try:
+        import FreeCAD  # type: ignore
+        base = Path(FreeCAD.getResourceDir())
+        for name in (
+            f"{fmt}_LandscapeTD.svg",
+            f"{fmt}_Landscape.svg",
+        ):
+            cand = base / "Mod" / "TechDraw" / "Templates" / name
+            if cand.exists():
+                return str(cand)
+    except Exception:
+        pass
+
+    # Fallback to any available template.
+    return default_template_path()
+
+
+# ---------------------------------------------------------------------------
+# Title block
+# ---------------------------------------------------------------------------
+
+def _fill_title_block(page: Any, *, project_name: str = "", version: str = "",
+                      date_str: str = "", scale_text: str = "",
+                      sheet_label: str = "") -> None:
+    """Fill TechDraw title block text fields (best-effort)."""
+    try:
+        templ = getattr(page, "Template", None)
+        if templ is None:
+            return
+
+        # TechDraw template text fields are accessible via EditableTexts dict.
+        texts: Dict[str, str] = {}
+        try:
+            texts = dict(getattr(templ, "EditableTexts", {}) or {})
+        except Exception:
+            return
+
+        # Common field names in FreeCAD templates (case-sensitive).
+        _map: Dict[str, str] = {}
+        if project_name:
+            for k in ("FC:Title", "DRAWING_TITLE", "Title", "CompanyName"):
+                if k in texts:
+                    _map[k] = project_name
+                    break
+            else:
+                _map["FC:Title"] = project_name
+
+        if version:
+            for k in ("FC:Revision", "Revision", "REV"):
+                if k in texts:
+                    _map[k] = version
+                    break
+
+        if date_str:
+            for k in ("FC:Date", "Date", "DATE"):
+                if k in texts:
+                    _map[k] = date_str
+                    break
+
+        if scale_text:
+            for k in ("FC:Scale", "Scale", "SCALE"):
+                if k in texts:
+                    _map[k] = scale_text
+                    break
+
+        if sheet_label:
+            for k in ("FC:Sheet", "Sheet", "SHEET"):
+                if k in texts:
+                    _map[k] = sheet_label
+                    break
+
+        if not _map:
+            return
+
+        texts.update(_map)
+        templ.EditableTexts = texts
+
+    except Exception as exc:
+        logging.debug("Title block fill failed: %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline-level TechDraw generation (no FreeCAD requirement for metadata)
+# ---------------------------------------------------------------------------
+
+@dataclass(slots=True)
+class TechDrawResult:
+    """Result of pipeline-level TechDraw generation."""
+    pages_created: int = 0
+    pdf_exported: int = 0
+    dxf_exported: int = 0
+    page_format: str = "A3"
+    views_mode: str = "all"
+    manifest_path: str = ""
+
+
+def generate_techdraw_for_dome(
+    params: "Any",
+    out_dir: Path,
+    doc: "Any" = None,
+) -> TechDrawResult:
+    """Generate TechDraw pages for the dome.
+
+    This is the high-level entry point used by the pipeline step.
+    When FreeCAD is not available, it writes a manifest JSON describing
+    what would be generated (for headless/CI environments).
+
+    Parameters
+    ----------
+    params : DomeParameters
+        Dome configuration (needs techdraw_* fields from ExportConfig).
+    out_dir : Path
+        Output directory for exports.
+    doc : FreeCAD.Document, optional
+        Active FreeCAD document. ``None`` in headless mode.
+    """
+    page_format = getattr(params, "techdraw_page_format", "A3") or "A3"
+    scale = float(getattr(params, "techdraw_scale", 0.02) or 0.02)
+    views_mode = str(getattr(params, "techdraw_views", "all") or "all")
+    project_name = str(getattr(params, "techdraw_project_name", "") or "")
+    version = str(getattr(params, "techdraw_version", "") or "")
+
+    drawings_dir = out_dir / "drawings"
+    drawings_dir.mkdir(parents=True, exist_ok=True)
+
+    result = TechDrawResult(
+        page_format=page_format,
+        views_mode=views_mode,
+    )
+
+    # Check scale validity.
+    if scale <= 0:
+        scale = 0.02
+    scale_text = f"1:{int(round(1.0 / scale))}" if scale > 0 else "1:50"
+
+    # Date for title block.
+    try:
+        import datetime
+        date_str = datetime.date.today().isoformat()
+    except Exception:
+        date_str = ""
+
+    # Try FreeCAD path.
+    fc_available = False
+    try:
+        import FreeCAD  # type: ignore
+        fc_available = True
+    except Exception:
+        pass
+
+    if fc_available and doc is not None:
+        template_path = template_path_for_format(page_format)
+
+        options = TechDrawOptions(
+            template_path=template_path,
+            page_prefix="TD_",
+            view_scale=scale,
+            auto_unit_scale=True,
+            include_struts=views_mode in ("all", "parts"),
+            include_panel_frames=views_mode in ("all", "parts"),
+            include_glass_panels=views_mode in ("all", "parts"),
+            include_panel_faces=False,
+            export_pdf=True,
+            export_dxf=False,
+            export_dir=str(drawings_dir),
+        )
+
+        td_result = generate_representative_techdraw(doc, options)
+        result.pages_created = td_result.get("created_pages", 0)
+        result.pdf_exported = td_result.get("exported_pdf", 0)
+        result.dxf_exported = td_result.get("exported_dxf", 0)
+
+        # Fill title blocks on created pages.
+        for obj in getattr(doc, "Objects", []):
+            obj_name = str(getattr(obj, "Name", ""))
+            if obj_name.startswith("TD_") and hasattr(obj, "Template"):
+                _fill_title_block(
+                    obj,
+                    project_name=project_name or "Geodesic Dome",
+                    version=version,
+                    date_str=date_str,
+                    scale_text=scale_text,
+                    sheet_label=obj_name,
+                )
+
+    # Write manifest (always, even in headless mode).
+    page_w, page_h = _PAGE_FORMATS.get(page_format.upper(), (420.0, 297.0))
+    manifest = {
+        "page_format": page_format,
+        "page_size_mm": {"width": page_w, "height": page_h},
+        "scale": scale,
+        "scale_text": scale_text,
+        "views_mode": views_mode,
+        "project_name": project_name or "Geodesic Dome",
+        "version": version,
+        "date": date_str,
+        "pages_created": result.pages_created,
+        "pdf_exported": result.pdf_exported,
+        "output_dir": str(drawings_dir),
+        "sheets": _plan_sheets(views_mode),
+    }
+    manifest_path = drawings_dir / "techdraw_manifest.json"
+    try:
+        import json
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+        result.manifest_path = str(manifest_path)
+    except Exception as exc:
+        logging.warning("TechDraw manifest write failed: %s", exc)
+
+    return result
+
+
+def _plan_sheets(views_mode: str) -> List[Dict[str, Any]]:
+    """Return planned sheet descriptions based on views mode."""
+    sheets: List[Dict[str, Any]] = []
+
+    if views_mode in ("all", "overview"):
+        sheets.append({
+            "name": "TD_Overview",
+            "description": "Dome overview — isometric, front, side, top",
+            "views": ["isometric", "front_elevation", "side_elevation", "top_plan"],
+        })
+        sheets.append({
+            "name": "TD_Section",
+            "description": "Cross-section through dome center",
+            "views": ["vertical_section", "detail_belt_joint"],
+        })
+
+    if views_mode in ("all", "parts"):
+        sheets.append({
+            "name": "TD_Struts",
+            "description": "Representative strut types — 4-view per unique length group",
+            "views": ["front", "top", "end", "isometric"],
+        })
+        sheets.append({
+            "name": "TD_PanelFrames",
+            "description": "Representative panel frames — 4-view per unique shape",
+            "views": ["front", "top", "end", "isometric"],
+        })
+
+    if views_mode in ("all", "nodes"):
+        sheets.append({
+            "name": "TD_NodeDetails",
+            "description": "Node connector details — plate/ball/pipe per unique valence",
+            "views": ["plan", "elevation", "detail"],
+        })
+
+    return sheets

@@ -10,6 +10,8 @@ from typing import Any, List, Optional, Tuple
 from .parameters import DomeParameters
 from .tessellation import Panel as PanelDef, TessellatedDome
 
+__all__ = ["PanelInstance", "PanelBuilder"]
+
 
 @dataclass(slots=True)
 class PanelInstance:
@@ -96,84 +98,13 @@ class PanelBuilder:
                     feature.Shape = shape
                     self._add_to_panels_group(doc, feature)
             # Optional glass solids (independent of face/frame generation).
-            if doc and plane_data is not None and float(getattr(self.params, "glass_thickness_m", 0.0)) > 0:
+            if doc and plane_data is not None and self.params.glass_thickness_m > 0:
                 seat_offset = self._glass_seat_offset_m(dome, panel, plane_data)
                 glass = self._make_glass_solid(plane_data, seat_offset_m=seat_offset)
                 if glass is None:
                     logging.warning("Unable to create glass panel for %s", name)
                 else:
-                    glass_name = f"GlassPanel_{panel.index:04d}"
-                    glass_obj = doc.addObject("Part::Feature", glass_name)
-                    glass_obj.Shape = glass
-                    self._add_to_panels_group(doc, glass_obj)
-                    try:
-                        # Tag for IFC export (BIM exporter looks for IfcType on objects).
-                        if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "IfcType"):
-                            glass_obj.addProperty(
-                                "App::PropertyString",
-                                "IfcType",
-                                "IFC",
-                                "IFC entity type for export",
-                            )
-                        if hasattr(glass_obj, "IfcType"):
-                            glass_obj.IfcType = "IfcPlate"
-
-                        if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "PanelIndex"):
-                            glass_obj.addProperty(
-                                "App::PropertyInteger",
-                                "PanelIndex",
-                                "Dome",
-                                "Source panel index",
-                            )
-                        if hasattr(glass_obj, "PanelIndex"):
-                            glass_obj.PanelIndex = int(panel.index)
-
-                        if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassThicknessM"):
-                            glass_obj.addProperty(
-                                "App::PropertyFloat",
-                                "GlassThicknessM",
-                                "Dome",
-                                "Glass thickness (m)",
-                            )
-                        if hasattr(glass_obj, "GlassThicknessM"):
-                            glass_obj.GlassThicknessM = float(getattr(self.params, "glass_thickness_m", 0.0))
-
-                        if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassSeatOffset"):
-                            glass_obj.addProperty(
-                                "App::PropertyFloat",
-                                "GlassSeatOffset",
-                                "Dome",
-                                "Signed offset along panel normal (m) used to seat glass on struts",
-                            )
-                        if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassNormal"):
-                            glass_obj.addProperty(
-                                "App::PropertyVector",
-                                "GlassNormal",
-                                "Dome",
-                                "Panel plane normal used for glass orientation",
-                            )
-                        if hasattr(glass_obj, "GlassSeatOffset"):
-                            glass_obj.GlassSeatOffset = float(seat_offset)
-                        if hasattr(glass_obj, "GlassNormal"):
-                            try:
-                                import FreeCAD  # type: ignore
-
-                                nx, ny, nz = plane_data.normal
-                                glass_obj.GlassNormal = FreeCAD.Vector(float(nx), float(ny), float(nz))
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    vo = getattr(glass_obj, "ViewObject", None)
-                    if vo is not None:
-                        try:
-                            vo.Transparency = 80
-                        except Exception:
-                            pass
-                        try:
-                            vo.ShapeColor = (0.2, 0.6, 1.0)
-                        except Exception:
-                            pass
+                    self._create_glass_panel_object(doc, panel, plane_data, glass, seat_offset)
             if create_frame and plane_data is not None:
                 frame_result = self._make_panel_frame(panel, plane_data, dome)
                 frame_shape = frame_result.shape if frame_result is not None else None
@@ -244,7 +175,7 @@ class PanelBuilder:
         doc = self.ensure_document()
         if not doc:
             return 0
-        if float(getattr(self.params, "glass_thickness_m", 0.0)) <= 0:
+        if self.params.glass_thickness_m <= 0:
             return 0
         created = 0
         for panel in dome.panels:
@@ -255,81 +186,83 @@ class PanelBuilder:
             glass = self._make_glass_solid(plane_data, seat_offset_m=seat_offset)
             if glass is None:
                 continue
-            glass_name = f"GlassPanel_{panel.index:04d}"
-            glass_obj = doc.addObject("Part::Feature", glass_name)
-            glass_obj.Shape = glass
-            self._add_to_panels_group(doc, glass_obj)
-            try:
-                # Tag for IFC export (BIM exporter looks for IfcType on objects).
-                if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "IfcType"):
-                    glass_obj.addProperty(
-                        "App::PropertyString",
-                        "IfcType",
-                        "IFC",
-                        "IFC entity type for export",
-                    )
-                if hasattr(glass_obj, "IfcType"):
-                    glass_obj.IfcType = "IfcPlate"
-
-                if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "PanelIndex"):
-                    glass_obj.addProperty(
-                        "App::PropertyInteger",
-                        "PanelIndex",
-                        "Dome",
-                        "Source panel index",
-                    )
-                if hasattr(glass_obj, "PanelIndex"):
-                    glass_obj.PanelIndex = int(panel.index)
-
-                if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassThicknessM"):
-                    glass_obj.addProperty(
-                        "App::PropertyFloat",
-                        "GlassThicknessM",
-                        "Dome",
-                        "Glass thickness (m)",
-                    )
-                if hasattr(glass_obj, "GlassThicknessM"):
-                    glass_obj.GlassThicknessM = float(getattr(self.params, "glass_thickness_m", 0.0))
-
-                if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassSeatOffset"):
-                    glass_obj.addProperty(
-                        "App::PropertyFloat",
-                        "GlassSeatOffset",
-                        "Dome",
-                        "Signed offset along panel normal (m) used to seat glass on struts",
-                    )
-                if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassNormal"):
-                    glass_obj.addProperty(
-                        "App::PropertyVector",
-                        "GlassNormal",
-                        "Dome",
-                        "Panel plane normal used for glass orientation",
-                    )
-                if hasattr(glass_obj, "GlassSeatOffset"):
-                    glass_obj.GlassSeatOffset = float(seat_offset)
-                if hasattr(glass_obj, "GlassNormal"):
-                    try:
-                        import FreeCAD  # type: ignore
-
-                        nx, ny, nz = plane_data.normal
-                        glass_obj.GlassNormal = FreeCAD.Vector(float(nx), float(ny), float(nz))
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            vo = getattr(glass_obj, "ViewObject", None)
-            if vo is not None:
-                try:
-                    vo.Transparency = 80
-                except Exception:
-                    pass
-                try:
-                    vo.ShapeColor = (0.2, 0.6, 1.0)
-                except Exception:
-                    pass
+            self._create_glass_panel_object(doc, panel, plane_data, glass, seat_offset)
             created += 1
         doc.recompute()
         return created
+
+    def _create_glass_panel_object(
+        self,
+        doc: Any,
+        panel: PanelDef,
+        plane_data: _PanelPlaneData,
+        glass_shape: Any,
+        seat_offset: float,
+    ) -> Any:
+        """Add a glass panel FreeCAD object with IFC metadata and styling.
+
+        Centralizes the glass object creation, tagging, and visual setup so that
+        both ``create_panels`` and ``create_glass_panels`` share the same code.
+        """
+        glass_name = f"GlassPanel_{panel.index:04d}"
+        glass_obj = doc.addObject("Part::Feature", glass_name)
+        glass_obj.Shape = glass_shape
+        self._add_to_panels_group(doc, glass_obj)
+        try:
+            if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "IfcType"):
+                glass_obj.addProperty(
+                    "App::PropertyString", "IfcType", "IFC", "IFC entity type for export",
+                )
+            if hasattr(glass_obj, "IfcType"):
+                glass_obj.IfcType = "IfcPlate"
+
+            if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "PanelIndex"):
+                glass_obj.addProperty(
+                    "App::PropertyInteger", "PanelIndex", "Dome", "Source panel index",
+                )
+            if hasattr(glass_obj, "PanelIndex"):
+                glass_obj.PanelIndex = int(panel.index)
+
+            if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassThicknessM"):
+                glass_obj.addProperty(
+                    "App::PropertyFloat", "GlassThicknessM", "Dome", "Glass thickness (m)",
+                )
+            if hasattr(glass_obj, "GlassThicknessM"):
+                glass_obj.GlassThicknessM = float(self.params.glass_thickness_m)
+
+            if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassSeatOffset"):
+                glass_obj.addProperty(
+                    "App::PropertyFloat", "GlassSeatOffset", "Dome",
+                    "Signed offset along panel normal (m) used to seat glass on struts",
+                )
+            if hasattr(glass_obj, "addProperty") and not hasattr(glass_obj, "GlassNormal"):
+                glass_obj.addProperty(
+                    "App::PropertyVector", "GlassNormal", "Dome",
+                    "Panel plane normal used for glass orientation",
+                )
+            if hasattr(glass_obj, "GlassSeatOffset"):
+                glass_obj.GlassSeatOffset = float(seat_offset)
+            if hasattr(glass_obj, "GlassNormal"):
+                try:
+                    import FreeCAD  # type: ignore
+
+                    nx, ny, nz = plane_data.normal
+                    glass_obj.GlassNormal = FreeCAD.Vector(float(nx), float(ny), float(nz))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        vo = getattr(glass_obj, "ViewObject", None)
+        if vo is not None:
+            try:
+                vo.Transparency = 80
+            except Exception:
+                pass
+            try:
+                vo.ShapeColor = (0.2, 0.6, 1.0)
+            except Exception:
+                pass
+        return glass_obj
 
     def _panels_group(self, doc: Any) -> Any | None:
         """Return a group for visible panel objects (faces/frames/glass)."""
@@ -414,10 +347,10 @@ class PanelBuilder:
     def _make_glass_solid(self, plane: _PanelPlaneData | None, seat_offset_m: float = 0.0):
         if plane is None:
             return None
-        thickness = float(getattr(self.params, "glass_thickness_m", 0.0))
+        thickness = float(self.params.glass_thickness_m)
         if thickness <= 0:
             return None
-        gap = float(getattr(self.params, "glass_gap_m", 0.0))
+        gap = float(self.params.glass_gap_m)
         inset = max(0.0, gap * 0.5)
 
         try:

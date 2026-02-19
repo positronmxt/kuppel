@@ -30,11 +30,30 @@ All parameters must remain editable via JSON config, CLI flags, or spreadsheet v
 ```text
 freecad_dome/
   __init__.py
-  parameters.py          # configuration loading + VarSet propagation
-  icosahedron.py         # base geometry + truncation utilities
-  tessellation.py        # frequency subdivision + node/edge data
-  struts.py              # Arch/Part pipelines for beveled members
-  panels.py              # panel face creation and stats
+  parameters.py          # configuration loading, validation, CLI parsing
+  icosahedron.py         # base icosahedron geometry + truncation
+  tessellation.py        # frequency subdivision + node/edge/strut data
+  struts.py              # strut solid generation (bevels, node-fit, bolt holes)
+  panels.py              # panel face + frame generation
+  node_connectors.py     # hub/plate/ball/pipe connector geometry + BOM
+  node_fit.py            # shared node-fit data (NodeFitInfo, NodeFitData)
+  vec3.py                # shared 3D vector algebra helpers
+  pipeline.py            # 21-step composable pipeline architecture
+  gui_dialog.py          # PySide parameter dialog (7-tab, 89 params)
+  base_wall.py           # cylindrical knee wall builder
+  door_opening.py        # door opening cuts
+  entry_porch.py         # framed/glazed vestibule at belt
+  covering.py            # covering material catalogue + thermal
+  ventilation.py         # ventilation planning (apex/ring/manual)
+  foundation.py          # foundation anchor layout + pour plan
+  loads.py               # Eurocode load calculations (wind/snow)
+  production.py          # cut-lists, saw table, assembly plans
+  weather.py             # weather protection (gaskets, drainage, eave)
+  costing.py             # cost estimation + BOM
+  spreadsheets.py        # FreeCAD spreadsheet export
+  techdraw.py            # TechDraw drawing generation
+  export.py              # IFC/STL/DXF model export
+  joint_variants.py      # joint variant comparison
 scripts/
   generate_dome.py       # headless entry point for FreeCAD 1.0.2
 ```
@@ -46,6 +65,7 @@ scripts/
 3. Generate Arch Structures for each strut, apply Part-based bevels respecting stock/kerf/clearance.
 4. Tag each strut with stable identifiers and metadata needed for `IfcMember` export.
 5. Implement export helpers (IFC first, then STL/DXF).
+6. ✅ Multi-dome projects (`multi_dome.py`): multiple domes with positional offsets, connecting corridors, merged foundation plan, and merged BOM. GUI tab "Mitmikkuppel" for interactive configuration.
 
 ## Configuration layers
 

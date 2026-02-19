@@ -10,6 +10,15 @@ from dataclasses import dataclass
 from math import atan2, acos, cos, sin, sqrt
 from typing import Dict, List, Sequence, Set, Tuple
 
+__all__ = [
+    "Vector3",
+    "Face",
+    "IcosahedronMesh",
+    "regular_icosahedron",
+    "build_icosahedron",
+    "truncate_mesh",
+]
+
 Vector3 = Tuple[float, float, float]
 Face = Tuple[int, int, int]
 

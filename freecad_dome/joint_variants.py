@@ -11,6 +11,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
+__all__ = [
+    "FrameConstruction",
+    "CornerTreatment",
+    "JointVariant",
+    "load_joint_variant_from_env",
+]
+
 
 def _coerce_enum(value: str | None, enum_type: type[Enum], *, default: Enum) -> Enum:
     if value is None:

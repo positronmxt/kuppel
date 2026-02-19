@@ -7,10 +7,28 @@
   "stock_height_m": 0.05,
   "kerf_m": 0.002,
   "clearance_m": 0.003,
+  "material": "wood",
+
+  "generate_panel_frames": true,
   "panel_frame_inset_m": 0.0,
   "panel_frame_profile_width_m": 0.022,
   "panel_frame_profile_height_m": 0.03,
-  "material": "wood",
+
+  "covering_type": "polycarbonate_twin_8",
+  "glass_thickness_m": 0.0,
+
+  "generate_node_connectors": true,
+  "node_connector_type": "plate",
+
+  "generate_foundation": true,
+  "foundation_type": "strip",
+
+  "generate_ventilation": true,
+  "generate_loads": true,
+  "generate_production": true,
+  "generate_costing": true,
+  "generate_spreadsheets": true,
+
   "materials": {
     "wood": {
       "Name": "Glulam Wood",

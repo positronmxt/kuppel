@@ -10,6 +10,9 @@ from uuid import uuid5, NAMESPACE_URL
 
 from .parameters import DomeParameters
 from .tessellation import Strut, TessellatedDome
+from . import vec3 as v3
+
+__all__ = ["StrutInstance", "StrutBuilder"]
 
 if TYPE_CHECKING:  # pragma: no cover - type hints only
     import Arch  # type: ignore
@@ -48,6 +51,140 @@ class StrutBuilder:
         s = float(self._fc_unit_scale)
         return (float(p[0]) * s, float(p[1]) * s, float(p[2]) * s)
 
+    def _endpoint_inset_m(self) -> float:
+        """Total inset (in metres) applied at each strut end.
+
+        Combines kerf compensation (E1) and connector plate inset (E7) so
+        the physical strut is shorter than the node-to-node tessellation length.
+        For lap-joint connectors (G1), no plate inset is applied — struts
+        extend to (or slightly past) the node.
+
+        When ``node_fit_extension_m > 0`` the strut is lengthened beyond the
+        tessellation node so node-fit planes have material to carve, yielding
+        tighter joints.  A negative net value means the strut overshoots the
+        node (desired for miter / tight-fit modes).
+        """
+        inset = float(self.params.kerf_m)  # kerf compensation per end
+        if (
+            self.params.connector_strut_inset
+            and self.params.generate_node_connectors
+            and self.params.node_connector_type != "lapjoint"
+        ):
+            inset += float(self.params.node_connector_thickness_m) * 0.5
+        # Extension: reduce inset (possibly making it negative → strut goes past node).
+        inset -= float(getattr(self.params, "node_fit_extension_m", 0.0))
+        return inset
+
+    # ------------------------------------------------------------------
+    # E8: Drill bolt holes in struts matching connector bolt positions
+    # ------------------------------------------------------------------
+
+    def drill_connector_bolt_holes(self, connectors: list) -> int:
+        """Drill bolt holes through strut ends to match connector bolt positions.
+
+        Call **after** both ``create_struts()`` and connector solid creation.
+        Modifies existing FreeCAD strut shapes *in place*.
+
+        Returns the number of struts successfully modified.
+        """
+        try:
+            import FreeCAD  # type: ignore
+            import Part  # type: ignore
+        except ImportError:
+            return 0
+
+        doc = self._doc
+        if doc is None:
+            return 0
+
+        bolt_r = float(self.params.node_connector_bolt_diameter_m) * 0.5
+        bolt_r_mm = self._fc_len(bolt_r)
+        plate_t_mm = self._fc_len(self.params.node_connector_thickness_m)
+        scale = float(self._fc_unit_scale)
+
+        # Build lookup: (strut_index, end_label) -> bolt position.
+        bolt_map: Dict[Tuple[int, str], Any] = {}
+        for nc in connectors:
+            for bp in nc.bolt_positions:
+                bolt_map[(bp.strut_index, bp.strut_end)] = bp
+
+        modified = 0
+        for obj in list(getattr(doc, "Objects", []) or []):
+            label = str(getattr(obj, "Label", ""))
+            if not label.startswith("Strut_"):
+                continue
+            # Find the base geometry object (Part::Feature with _Geom suffix).
+            base = None
+            if hasattr(obj, "Base") and obj.Base is not None:
+                base = obj.Base
+            elif hasattr(obj, "Shape"):
+                base = obj
+            if base is None or not hasattr(base, "Shape"):
+                continue
+
+            # Determine strut_index from the StrutLengthMM or StrutFamily + sequence.
+            # We match by inspecting all connector bolt positions against shape bounds.
+            shape = base.Shape
+            if shape is None or (hasattr(shape, "isNull") and shape.isNull()):
+                continue
+
+            # Try both ends.
+            drilled = False
+            for strut_idx, end_label in list(bolt_map.keys()):
+                bp = bolt_map.get((strut_idx, end_label))
+                if bp is None:
+                    continue
+                # Bolt position in mm.
+                bx = float(bp.center[0]) * scale
+                by = float(bp.center[1]) * scale
+                bz = float(bp.center[2]) * scale
+                bolt_center = FreeCAD.Vector(bx, by, bz)
+
+                # Check if this bolt is near any vertex of the strut shape.
+                try:
+                    verts = shape.Vertexes
+                    min_dist = min(
+                        (FreeCAD.Vector(v.Point) - bolt_center).Length
+                        for v in verts
+                    ) if verts else 1e12
+                except Exception:
+                    continue
+
+                # Only drill if the bolt center is within a reasonable distance.
+                stock_max_mm = self._fc_len(max(self.params.stock_width_m, self.params.stock_height_m))
+                if min_dist > stock_max_mm * 3:
+                    continue
+
+                # Create the bolt hole cylinder along the plate normal (= radial axis).
+                axis = FreeCAD.Vector(
+                    float(bp.axis[0]),
+                    float(bp.axis[1]),
+                    float(bp.axis[2]),
+                )
+                hole_depth = stock_max_mm * 2.0
+                hole_base = bolt_center - axis * (hole_depth * 0.5)
+                hole = Part.makeCylinder(bolt_r_mm, hole_depth, hole_base, axis)
+
+                try:
+                    new_shape = shape.cut(hole)
+                    if new_shape is not None and not new_shape.isNull():
+                        base.Shape = new_shape
+                        shape = new_shape
+                        drilled = True
+                except Exception:
+                    pass
+
+            if drilled:
+                modified += 1
+
+        if modified:
+            try:
+                doc.recompute()
+            except Exception:
+                pass
+            logging.info("Drilled bolt holes in %d struts", modified)
+        return modified
+
     def ensure_document(self) -> Optional[Any]:
         try:
             import FreeCAD  # type: ignore
@@ -71,24 +208,117 @@ class StrutBuilder:
 
         grouped = self._group_by_length(dome.struts)
 
+        split_enabled = self.params.split_struts_per_panel
+
         for (group_label, struts) in grouped:
             for sequence, strut in enumerate(struts, start=1):
-                name = f"Strut_{group_label}_{sequence:03d}"
-                if doc:
-                    base = self._make_arch_structure(doc, name, strut, group_label=group_label)
+                # Headless mode (no FreeCAD): still emit a manifest that matches the
+                # intended split behavior.
+                if not doc:
+                    if split_enabled and self._should_split_strut(strut):
+                        pid_primary, pid_secondary = self._panel_ids_for_split(dome, strut)
+                        for pid in (pid_primary, pid_secondary):
+                            suffix = f"_P{int(pid):04d}" if pid is not None else ""
+                            name = f"Strut_{group_label}_{sequence:03d}{suffix}"
+                            guid = self._guid_for(name, strut)
+                            instances.append(
+                                StrutInstance(
+                                    name=name,
+                                    length=strut.length,
+                                    material=self.params.material,
+                                    group=group_label,
+                                    sequence=sequence,
+                                    ifc_guid=guid,
+                                )
+                            )
+                    else:
+                        name = f"Strut_{group_label}_{sequence:03d}"
+                        guid = self._guid_for(name, strut)
+                        instances.append(
+                            StrutInstance(
+                                name=name,
+                                length=strut.length,
+                                material=self.params.material,
+                                group=group_label,
+                                sequence=sequence,
+                                ifc_guid=guid,
+                            )
+                        )
+                    continue
+
+                # FreeCAD mode: build the full strut once, then optionally split it.
+                shape = None
+                bevel_debug: dict[str, object] = {}
+                if self.params.use_bevels:
+                    shape, bevel_debug = self._build_beveled_shape(strut)
+                else:
+                    bevel_debug = {"bevel_used": False, "reason": "bevel_disabled"}
+                if shape is None:
+                    shape = self._simple_prism(strut)
+                    bevel_debug.setdefault("bevel_used", False)
+                    bevel_debug.setdefault("reason", "prismatic_fallback")
+                if shape is None:
+                    logging.error("Unable to create geometry for strut %d", strut.index)
+                    continue
+
+                made_any = False
+                if split_enabled and self._should_split_strut(strut):
+                    halves = self._split_shape_longitudinal_for_panels(dome, strut, shape)
+                    if len(halves) == 2:
+                        for pid, half_shape in halves:
+                            suffix = f"_P{int(pid):04d}" if pid is not None else ""
+                            name = f"Strut_{group_label}_{sequence:03d}{suffix}"
+                            base = self._make_arch_structure(
+                                doc,
+                                name,
+                                strut,
+                                group_label=group_label,
+                                shape_override=half_shape,
+                                bevel_debug_override=bevel_debug,
+                            )
+                            if base is not None:
+                                helper_bases.append(base)
+                            guid = self._guid_for(name, strut)
+                            instances.append(
+                                StrutInstance(
+                                    name=name,
+                                    length=strut.length,
+                                    material=self.params.material,
+                                    group=group_label,
+                                    sequence=sequence,
+                                    ifc_guid=guid,
+                                )
+                            )
+                            made_any = True
+                    else:
+                        logging.warning(
+                            "Requested split_struts_per_panel but could not split strut %d; using unsplit strut",
+                            strut.index,
+                        )
+
+                if not made_any:
+                    name = f"Strut_{group_label}_{sequence:03d}"
+                    base = self._make_arch_structure(
+                        doc,
+                        name,
+                        strut,
+                        group_label=group_label,
+                        shape_override=shape,
+                        bevel_debug_override=bevel_debug,
+                    )
                     if base is not None:
                         helper_bases.append(base)
-                guid = self._guid_for(name, strut)
-                instances.append(
-                    StrutInstance(
-                        name=name,
-                        length=strut.length,
-                        material=self.params.material,
-                        group=group_label,
-                        sequence=sequence,
-                        ifc_guid=guid,
+                    guid = self._guid_for(name, strut)
+                    instances.append(
+                        StrutInstance(
+                            name=name,
+                            length=strut.length,
+                            material=self.params.material,
+                            group=group_label,
+                            sequence=sequence,
+                            ifc_guid=guid,
+                        )
                     )
-                )
 
         if doc:
             try:
@@ -105,7 +335,16 @@ class StrutBuilder:
     def document(self) -> Optional[Any]:
         return self._doc
 
-    def _make_arch_structure(self, doc: Any, name: str, strut: Strut, group_label: str) -> Any | None:
+    def _make_arch_structure(
+        self,
+        doc: Any,
+        name: str,
+        strut: Strut,
+        group_label: str,
+        *,
+        shape_override: Any | None = None,
+        bevel_debug_override: Dict[str, object] | None = None,
+    ) -> Any | None:
         try:
             import Arch  # type: ignore
             import FreeCAD  # type: ignore
@@ -114,30 +353,33 @@ class StrutBuilder:
         except ImportError:  # pragma: no cover - headless/dev mode
             return None
 
-        shape = None
-        bevel_debug: dict[str, object] = {}
-        if self.params.use_bevels:
-            shape, bevel_debug = self._build_beveled_shape(strut)
-        else:
-            bevel_debug = {"bevel_used": False, "reason": "bevel_disabled"}
+        # Optional fast-path: allow caller to supply a pre-built shape (e.g. split halves).
+        shape = shape_override
+        bevel_debug: dict[str, object] = dict(bevel_debug_override or {})
+
         if shape is None:
-            shape = self._simple_prism(strut)
-            bevel_debug.setdefault("bevel_used", False)
-            bevel_debug.setdefault("reason", "prismatic_fallback")
-            # Populate intended end-plane metadata even for prismatic fallbacks.
-            # (The geometry may still be cut; this is for QA/debugging and macros.)
-            try:
-                for end_label, key_point, key_normal in (
-                    ("start", "start_point", "start_normal"),
-                    ("end", "end_point", "end_normal"),
-                ):
-                    planes = self._endpoint_cut_planes.get((strut.index, end_label), [])
-                    if planes:
-                        pt_t, n_t = planes[0]
-                        bevel_debug.setdefault(key_point, tuple(map(float, pt_t)))
-                        bevel_debug.setdefault(key_normal, tuple(map(float, n_t)))
-            except Exception:
-                pass
+            if self.params.use_bevels:
+                shape, bevel_debug = self._build_beveled_shape(strut)
+            else:
+                bevel_debug = {"bevel_used": False, "reason": "bevel_disabled"}
+            if shape is None:
+                shape = self._simple_prism(strut)
+                bevel_debug.setdefault("bevel_used", False)
+                bevel_debug.setdefault("reason", "prismatic_fallback")
+                # Populate intended end-plane metadata even for prismatic fallbacks.
+                # (The geometry may still be cut; this is for QA/debugging and macros.)
+                try:
+                    for end_label, key_point, key_normal in (
+                        ("start", "start_point", "start_normal"),
+                        ("end", "end_point", "end_normal"),
+                    ):
+                        planes = self._endpoint_cut_planes.get((strut.index, end_label), [])
+                        if planes:
+                            pt_t, n_t = planes[0]
+                            bevel_debug.setdefault(key_point, tuple(map(float, pt_t)))
+                            bevel_debug.setdefault(key_normal, tuple(map(float, n_t)))
+                except Exception:
+                    pass
         if shape is None:
             logging.error("Unable to create geometry for strut %s", name)
             return None
@@ -233,6 +475,127 @@ class StrutBuilder:
             pass
 
         return base
+
+    def _should_split_strut(self, strut: Strut) -> bool:
+        """Return True when a strut should be split into per-panel halves."""
+        if not self.params.split_struts_per_panel:
+            return False
+        # Only meaningful when the strut is shared by exactly 2 adjacent panels.
+        if len(getattr(strut, "panel_indices", ()) or ()) != 2:
+            return False
+        # Never split belt-ring members.
+        if self._is_belt_strut(strut):
+            return False
+        return True
+
+    def _is_belt_strut(self, strut: Strut) -> bool:
+        hemi = float(self.params.hemisphere_ratio)
+        if hemi >= 0.999999:
+            return False
+        belt_height = float(self.params.radius_m) * (1.0 - 2.0 * hemi)
+        eps = max(1e-6, float(self.params.radius_m) * 1e-5)
+        return (
+            abs(float(strut.start[2]) - belt_height) <= eps
+            and abs(float(strut.end[2]) - belt_height) <= eps
+        )
+
+    def _panel_ids_for_split(self, dome: TessellatedDome, strut: Strut) -> Tuple[int | None, int | None]:
+        """Return (panel_id_for_primary, panel_id_for_secondary) for naming/assignment."""
+        panel_ids = list(getattr(strut, "panel_indices", ()) or [])
+        if len(panel_ids) != 2:
+            return (panel_ids[0] if panel_ids else None), None
+
+        pid_primary = self._match_panel_id_by_normal(dome, panel_ids, strut.primary_normal)
+        pid_secondary = None
+        if getattr(strut, "secondary_normal", None) is not None:
+            pid_secondary = self._match_panel_id_by_normal(dome, panel_ids, strut.secondary_normal)  # type: ignore[arg-type]
+
+        # Ensure we return two different panel ids when possible.
+        if pid_secondary is None or pid_secondary == pid_primary:
+            for pid in panel_ids:
+                if pid != pid_primary:
+                    pid_secondary = pid
+                    break
+        return pid_primary, pid_secondary
+
+    def _match_panel_id_by_normal(self, dome: TessellatedDome, panel_ids: List[int], normal: Tuple[float, float, float]) -> int | None:
+        """Match a normal to the closest dome panel normal by dot product."""
+        nx, ny, nz = float(normal[0]), float(normal[1]), float(normal[2])
+        best_pid: int | None = None
+        best_dot = -1e9
+        for pid in panel_ids:
+            if pid < 0 or pid >= len(dome.panels):
+                continue
+            pn = dome.panels[pid].normal
+            dot = float(pn[0]) * nx + float(pn[1]) * ny + float(pn[2]) * nz
+            if dot > best_dot:
+                best_dot = dot
+                best_pid = pid
+        return best_pid
+
+    def _split_shape_longitudinal_for_panels(self, dome: TessellatedDome, strut: Strut, shape) -> List[Tuple[int | None, Any]]:
+        """Split a strut solid lengthwise into 2 halves, one per adjacent panel.
+
+        Returns a list [(panel_id, half_shape), ...] on success, otherwise [].
+        """
+        try:
+            import FreeCAD  # type: ignore
+            from FreeCAD import Vector  # type: ignore
+        except Exception:  # pragma: no cover
+            return []
+
+        if getattr(strut, "secondary_normal", None) is None:
+            return []
+        if len(getattr(strut, "panel_indices", ()) or ()) != 2:
+            return []
+
+        start = Vector(*self._fc_point(strut.start))
+        end = Vector(*self._fc_point(strut.end))
+        axis = end - start
+        if axis.Length <= 1e-12:
+            return []
+        axis.normalize()
+        mid = (start + end) * 0.5
+
+        # Project panel normals to the plane perpendicular to the strut axis.
+        n1 = Vector(*strut.primary_normal)
+        n2 = Vector(*strut.secondary_normal)  # type: ignore[arg-type]
+        n1 = n1 - axis * float(n1.dot(axis))
+        n2 = n2 - axis * float(n2.dot(axis))
+        if n1.Length <= 1e-9 or n2.Length <= 1e-9:
+            return []
+        n1.normalize()
+        n2.normalize()
+
+        # Plane contains the axis and the bisector direction between the two panel normals.
+        bis = n1 + n2
+        if bis.Length <= 1e-9:
+            bis = Vector(n1)
+        if bis.Length <= 1e-9:
+            return []
+        bis.normalize()
+
+        plane_normal = axis.cross(bis)
+        if plane_normal.Length <= 1e-9:
+            plane_normal = axis.cross(n1)
+        if plane_normal.Length <= 1e-9:
+            return []
+        plane_normal.normalize()
+
+        span = float((end - start).Length + self._fc_len(self.params.radius_m) + self._fc_len(self.params.stock_width_m) * 4.0)
+        offset = float(self._fc_len(min(self.params.stock_width_m, self.params.stock_height_m)) * float(self.params.split_keep_offset_factor) + self._fc_len(max(self.params.clearance_m, 0.001)))
+        keep1 = mid + n1 * offset
+        keep2 = mid + n2 * offset
+
+        half1 = self._cut_with_plane(shape, mid, plane_normal, keep1, span)
+        if half1 is None or not self._is_shape_valid(half1):
+            return []
+        half2 = self._cut_with_plane(shape, mid, plane_normal, keep2, span)
+        if half2 is None or not self._is_shape_valid(half2):
+            return []
+
+        pid_primary, pid_secondary = self._panel_ids_for_split(dome, strut)
+        return [(pid_primary, half1), (pid_secondary, half2)]
 
     def _struts_group(self, doc: Any) -> Any | None:
         """Return a group for visible strut objects."""
@@ -374,19 +737,29 @@ class StrutBuilder:
         except ImportError:  # pragma: no cover - headless/dev mode
             return None, {}
 
-        start = Vector(*self._fc_point(strut.start))
-        end = Vector(*self._fc_point(strut.end))
+        # Apply kerf + connector inset: shorten strut from each end.
+        inset_fc = self._fc_len(self._endpoint_inset_m())
+        raw_start = Vector(*self._fc_point(strut.start))
+        raw_end = Vector(*self._fc_point(strut.end))
+        raw_dir = raw_end - raw_start
+        raw_length = raw_dir.Length
+        if raw_length <= 1e-12:
+            return None, {"bevel_used": False}
+        axis_vec = Vector(raw_dir)
+        axis_vec.normalize()
+
+        start = raw_start + axis_vec * inset_fc
+        end = raw_end - axis_vec * inset_fc
         direction = end - start
         length = direction.Length
+
         stock_max = self._fc_len(max(self.params.stock_width_m, self.params.stock_height_m))
-        min_length = stock_max * 0.5
-        prism_only_length = stock_max * 3.0
+        min_length = stock_max * float(self.params.min_strut_length_factor)
+        prism_only_length = stock_max * float(self.params.prism_only_length_factor)
         if length <= min_length:
             return None, {"bevel_used": False}
 
-        axis_vec = Vector(direction)
-        axis_vec.normalize()
-        padding = self._fc_len(self.params.kerf_m * 2 + self.params.clearance_m)
+        padding = self._fc_len(self.params.clearance_m)
         if length <= prism_only_length:
             # Strut is too short to survive bevel cuts; use rectangular prism.
             midpoint_vec = (start + end) * 0.5
@@ -412,18 +785,25 @@ class StrutBuilder:
                 pass
             return (solid2 if solid2 is not None else solid, debug)
         midpoint_vec = (start + end) * 0.5
-        solid = self._make_aligned_box(length, axis_vec, start, padding, midpoint_vec)
-
         keep_point = midpoint_vec
 
         # Node-fit algorithm:
-        # - Cut both ends to a common node plane (radial plane through node)
-        # - Add two separation planes per end so neighboring struts don't overlap in the node plane
-        # - Apply separation planes only to a short end-cap region so the whole strut doesn't become wedge-shaped
+        # - "planar": Cut both ends to node/separation planes (cap region only)
+        # - "tapered": Use a tapered solid (CNC-friendly), then planar cuts
+        # - "voronoi": Voronoi angular partition (all bisector planes, full solid)
         bevel_debug: dict[str, object] = {"bevel_used": True}
 
         span = float(length + padding + self._fc_len(self.params.radius_m))
-        cap_len = max(stock_max * 2.0, stock_max + self._fc_len(self.params.clearance_m + self.params.kerf_m))
+        cap_len = max(
+            stock_max * float(self.params.cap_length_factor),
+            stock_max + self._fc_len(self.params.clearance_m + self.params.kerf_m),
+        )
+
+        node_fit_mode = getattr(self.params, "node_fit_mode", "planar")
+        if node_fit_mode == "tapered":
+            solid = self._make_tapered_solid(length, axis_vec, start, padding, midpoint_vec, cap_len)
+        else:
+            solid = self._make_aligned_box(length, axis_vec, start, padding, midpoint_vec)
 
         solid, start_debug = self._apply_endpoint_node_fit_cuts(
             solid,
@@ -537,7 +917,7 @@ class StrutBuilder:
         except ImportError:  # pragma: no cover
             return solid
 
-        hemi = float(getattr(self.params, "hemisphere_ratio", 1.0) or 1.0)
+        hemi = float(self.params.hemisphere_ratio)
         if hemi >= 0.999999:
             return solid
 
@@ -687,6 +1067,35 @@ class StrutBuilder:
             debug["reason"] = f"missing_node_planes_{end_label}"
             return None, debug
 
+        node_fit_mode = getattr(self.params, "node_fit_mode", "planar")
+
+        # ---- Voronoi mode: apply bisector planes to the FULL solid ----
+        # All bisector planes pass through the node, so near the strut midpoint
+        # they are far from the cross-section and don't over-trim.
+        if node_fit_mode == "voronoi":
+            result = solid
+            applied = 0
+            for idx, (pt_t, n_t) in enumerate(planes):
+                pt = Vector(*pt_t)
+                n = Vector(*n_t)
+                if n.Length == 0:
+                    continue
+                tmp = self._cut_with_plane(result, pt, n, keep_point, span)
+                if tmp is not None and self._is_shape_valid(tmp):
+                    result = tmp
+                    applied += 1
+                else:
+                    debug[f"voronoi_plane_{idx}_skipped"] = True
+            debug[f"{end_label}_voronoi_planes_applied"] = applied
+            if planes:
+                pt0, n0 = planes[0]
+                debug[f"{end_label}_node_plane"] = (
+                    tuple(map(float, pt0)),
+                    tuple(map(float, n0)),
+                )
+            return result, debug
+
+        # ---- Planar / Tapered mode: cap-split then apply planes to cap ----
         # Split strut into end-cap + remainder using a plane perpendicular to the strut axis.
         axis_vec = Vector(axis_from_node)
         if axis_vec.Length == 0:
@@ -698,7 +1107,7 @@ class StrutBuilder:
         # Keep cap split plane within the strut span; if it goes past the other end,
         # half-space selection can become unstable and separation cuts can collapse to empty.
         strut_len_fc = float(self._fc_len(strut.length))
-        max_cap = float(max(1e-3, min(cap_length, strut_len_fc * 0.45)))
+        max_cap = float(max(1e-3, min(cap_length, strut_len_fc * float(self.params.max_cap_ratio))))
 
         # A stable reference point inside the end-cap along the axis.
         # Keep it *deep* into the cap so that endpoint planes slightly away from the node
@@ -748,6 +1157,54 @@ class StrutBuilder:
                 debug["reason"] = f"fuse_failed_{end_label}"
                 return None, debug
 
+        # Optional fillet on end-cap edges to smooth sharp bevel transitions.
+        fillet_r = float(self.params.bevel_fillet_radius_m)
+        if fillet_r > 0 and hasattr(fused, "makeFillet"):
+            fillet_r_fc = self._fc_len(fillet_r)
+            try:
+                edges = fused.Edges
+                if edges:
+                    # Fillet all edges that are near the end-cap region.
+                    cap_edges = [
+                        e for e in edges
+                        if any(
+                            (Vector(v.Point) - node_vec).Length < max_cap * 1.2
+                            for v in e.Vertexes
+                        )
+                    ]
+                    if cap_edges:
+                        filleted = fused.makeFillet(fillet_r_fc, cap_edges)
+                        if self._is_shape_valid(filleted):
+                            fused = filleted
+            except Exception:
+                pass  # fillet failure is non-fatal
+
+        # E2: Cap blend mode — smooth the cap/body junction.
+        blend_mode = getattr(self.params, "cap_blend_mode", "sharp")
+        if blend_mode != "sharp":
+            try:
+                # Identify edges at the cap/body junction (near cap_plane_point).
+                junction_tol = max_cap * 0.15
+                junction_edges = [
+                    e for e in fused.Edges
+                    if any(
+                        abs((Vector(v.Point) - cap_plane_point).dot(axis_vec)) < junction_tol
+                        for v in e.Vertexes
+                    )
+                ]
+                if junction_edges:
+                    blend_size = max(1e-4, max_cap * 0.15)
+                    if blend_mode == "chamfer" and hasattr(fused, "makeChamfer"):
+                        blended = fused.makeChamfer(blend_size, junction_edges)
+                        if self._is_shape_valid(blended):
+                            fused = blended
+                    elif blend_mode == "fillet" and hasattr(fused, "makeFillet"):
+                        blended = fused.makeFillet(blend_size, junction_edges)
+                        if self._is_shape_valid(blended):
+                            fused = blended
+            except Exception:
+                pass  # blend failure is non-fatal
+
         # Record the primary node plane (first plane in list).
         if planes:
             point_t, normal_t = planes[0]
@@ -773,36 +1230,18 @@ class StrutBuilder:
             incident.setdefault(s.start_index, []).append((s, "start", (ex - sx, ey - sy, ez - sz)))
             incident.setdefault(s.end_index, []).append((s, "end", (sx - ex, sy - ey, sz - ez)))
 
-        def _norm(v: Tuple[float, float, float]) -> float:
-            return math.sqrt(v[0] * v[0] + v[1] * v[1] + v[2] * v[2])
-
-        def _normalize(v: Tuple[float, float, float]) -> Tuple[float, float, float]:
-            n = _norm(v)
-            if n <= 1e-12:
-                return (0.0, 0.0, 0.0)
-            return (v[0] / n, v[1] / n, v[2] / n)
-
-        def _dot(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> float:
-            return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-
-        def _cross(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> Tuple[float, float, float]:
-            return (
-                a[1] * b[2] - a[2] * b[1],
-                a[2] * b[0] - a[0] * b[2],
-                a[0] * b[1] - a[1] * b[0],
-            )
-
-        def _sub(a: Tuple[float, float, float], b: Tuple[float, float, float]) -> Tuple[float, float, float]:
-            return (a[0] - b[0], a[1] - b[1], a[2] - b[2])
-
-        def _mul(a: Tuple[float, float, float], s: float) -> Tuple[float, float, float]:
-            return (a[0] * s, a[1] * s, a[2] * s)
+        _norm = v3.norm
+        _normalize = v3.normalize
+        _dot = v3.dot
+        _cross = v3.cross
+        _sub = v3.sub
+        _mul = v3.scale
 
         # Result mapping.
         endpoint_planes: Dict[Tuple[int, str], List[Tuple[Tuple[float, float, float], Tuple[float, float, float]]]] = {}
 
-        plane_mode = str(getattr(self.params, "node_fit_plane_mode", "radial") or "radial")
-        use_separation = bool(getattr(self.params, "node_fit_use_separation_planes", True))
+        plane_mode = self.params.node_fit_plane_mode
+        use_separation = self.params.node_fit_use_separation_planes
 
         for node_idx, items in incident.items():
             if not items:
@@ -815,7 +1254,7 @@ class StrutBuilder:
             # IMPORTANT: Truncation also creates nodes that are not on the sphere radius,
             # but they are NOT belt nodes. Therefore belt detection must be based on Z,
             # not on the radius deviation.
-            hemisphere_ratio = float(getattr(self.params, "hemisphere_ratio", 1.0) or 1.0)
+            hemisphere_ratio = float(self.params.hemisphere_ratio)
             belt_node = False
             belt_height = None
             belt_eps = max(1e-6, float(self.params.radius_m) * 1e-5)
@@ -933,10 +1372,34 @@ class StrutBuilder:
                         endpoint_planes[(s.index, end_label)] = planes
                         continue
                 else:
-                    if plane_mode == "axis":
+                    if plane_mode in ("axis", "miter"):
                         planes.append((self._fc_point(p), a))
                     else:
                         planes.append((self._fc_point(p), r))
+
+                # ---- Voronoi mode: all bisector planes, no node plane ----
+                node_fit_mode = getattr(self.params, "node_fit_mode", "planar")
+                if node_fit_mode == "voronoi":
+                    # Replace the primary node plane with Voronoi bisector
+                    # planes between this strut and ALL other struts at the node.
+                    # Sorted by angular proximity (closest neighbor = most
+                    # significant cut) for robust sequential boolean.
+                    planes.clear()
+                    voronoi_list: list[tuple[float, tuple[tuple[float, float, float], tuple[float, float, float]]]] = []
+                    for j, (_ang_j, _s_j, _end_j, a_j, _t_j) in enumerate(enriched):
+                        if i == j:
+                            continue
+                        diff = _sub(a, a_j)
+                        bis_n = _normalize(diff)
+                        if _norm(bis_n) <= 1e-12:
+                            continue
+                        ang_dist = v3.angle_between(a, a_j)
+                        voronoi_list.append((ang_dist, (self._fc_point(p), bis_n)))
+                    voronoi_list.sort(key=lambda x: x[0])
+                    for _, plane in voronoi_list:
+                        planes.append(plane)
+                    endpoint_planes[(s.index, end_label)] = planes
+                    continue
 
                 if not use_separation:
                     endpoint_planes[(s.index, end_label)] = planes
@@ -944,18 +1407,43 @@ class StrutBuilder:
 
                 # Separation plane between prev and this.
                 bis_prev = _normalize((prev_t[0] + t[0], prev_t[1] + t[1], prev_t[2] + t[2]))
+                n1 = None
                 if _norm(bis_prev) > 1e-12:
                     n1 = _normalize(_cross(r, bis_prev))
                     if _dot(t, n1) < 0:
                         n1 = (-n1[0], -n1[1], -n1[2])
-                    planes.append((planes[0][0], n1))
 
                 # Separation plane between this and next.
                 bis_next = _normalize((t[0] + next_t[0], t[1] + next_t[1], t[2] + next_t[2]))
+                n2 = None
                 if _norm(bis_next) > 1e-12:
                     n2 = _normalize(_cross(r, bis_next))
                     if _dot(t, n2) < 0:
                         n2 = (-n2[0], -n2[1], -n2[2])
+
+                # Min-wedge-angle guard: if the two separation planes form a
+                # too-narrow wedge (< min_wedge_angle_deg), replace both with
+                # a single bisector plane to avoid "teeth" artifacts.
+                min_wedge_rad = math.radians(float(self.params.min_wedge_angle_deg))
+                if n1 is not None and n2 is not None:
+                    wedge_angle = v3.angle_between(n1, n2)
+                    if wedge_angle < min_wedge_rad:
+                        # Merge: single plane at the bisector of n1 and n2.
+                        n_merged = _normalize((
+                            n1[0] + n2[0],
+                            n1[1] + n2[1],
+                            n1[2] + n2[2],
+                        ))
+                        if _norm(n_merged) > 1e-12:
+                            planes.append((planes[0][0], n_merged))
+                        else:
+                            planes.append((planes[0][0], n1))
+                    else:
+                        planes.append((planes[0][0], n1))
+                        planes.append((planes[0][0], n2))
+                elif n1 is not None:
+                    planes.append((planes[0][0], n1))
+                elif n2 is not None:
                     planes.append((planes[0][0], n2))
 
                 endpoint_planes[(s.index, end_label)] = planes
@@ -1068,15 +1556,22 @@ class StrutBuilder:
         except ImportError:  # pragma: no cover - headless/dev mode
             return None
 
-        start = Vector(*self._fc_point(strut.start))
-        end = Vector(*self._fc_point(strut.end))
+        # Apply kerf + connector inset (same as _build_beveled_shape).
+        inset_fc = self._fc_len(self._endpoint_inset_m())
+        raw_start = Vector(*self._fc_point(strut.start))
+        raw_end = Vector(*self._fc_point(strut.end))
+        raw_dir = raw_end - raw_start
+        if raw_dir.Length <= 1e-12:
+            return None
+        axis_vec = Vector(raw_dir)
+        axis_vec.normalize()
+
+        start = raw_start + axis_vec * inset_fc
+        end = raw_end - axis_vec * inset_fc
         direction = end - start
         length = direction.Length
-        if length == 0:
+        if length <= 0:
             return None
-
-        axis_vec = Vector(direction)
-        axis_vec.normalize()
 
         padding = self._fc_len(self.params.clearance_m)
         midpoint_vec = (start + end) * 0.5
@@ -1089,9 +1584,12 @@ class StrutBuilder:
         # If bevels are enabled but we fell back to a prism, still apply the node-fit
         # endpoint cuts (node plane + optional separation planes) so the strut is
         # actually trimmed for node connection.
-        if bool(getattr(self.params, "use_bevels", False)):
+        if self.params.use_bevels:
             stock_max = float(self._fc_len(max(self.params.stock_width_m, self.params.stock_height_m)))
-            cap_len = max(stock_max * 2.0, stock_max + float(self._fc_len(self.params.clearance_m + self.params.kerf_m)))
+            cap_len = max(
+                stock_max * float(self.params.cap_length_factor),
+                stock_max + float(self._fc_len(self.params.clearance_m + self.params.kerf_m)),
+            )
             solid2, _ = self._apply_endpoint_node_fit_cuts(
                 solid,
                 strut,
@@ -1224,11 +1722,45 @@ class StrutBuilder:
         total_length = float(length + padding)
         stock_w = float(self._fc_len(self.params.stock_width_m))
         stock_h = float(self._fc_len(self.params.stock_height_m))
-        box = Part.makeBox(total_length, stock_w, stock_h)
-        center_offset = FreeCAD.Placement(
-            Vector(-float(padding) / 2.0, -stock_w / 2.0, -stock_h / 2.0),
-            FreeCAD.Rotation(),
-        )
+
+        profile = getattr(self.params, "strut_profile", "rectangular")
+
+        if profile == "round":
+            # Cylinder aligned along X with diameter = stock_width.
+            radius = stock_w / 2.0
+            solid = Part.makeCylinder(radius, total_length, Vector(0, 0, 0), Vector(1, 0, 0))
+            center_offset = FreeCAD.Placement(
+                Vector(-float(padding) / 2.0, 0, 0),
+                FreeCAD.Rotation(),
+            )
+        elif profile == "trapezoidal":
+            # Trapezoid: bottom = stock_w, top = stock_w * 0.6, height = stock_h.
+            top_w = stock_w * 0.6
+            hw = stock_w / 2.0
+            htw = top_w / 2.0
+            hh = stock_h / 2.0
+            # Wire in YZ plane at X=0, extruded along X.
+            pts = [
+                Vector(0, -hw, -hh),
+                Vector(0, hw, -hh),
+                Vector(0, htw, hh),
+                Vector(0, -htw, hh),
+                Vector(0, -hw, -hh),
+            ]
+            wire = Part.makePolygon(pts)
+            face = Part.Face(wire)
+            solid = face.extrude(Vector(total_length, 0, 0))
+            center_offset = FreeCAD.Placement(
+                Vector(-float(padding) / 2.0, 0, 0),
+                FreeCAD.Rotation(),
+            )
+        else:
+            # Rectangular (default).
+            solid = Part.makeBox(total_length, stock_w, stock_h)
+            center_offset = FreeCAD.Placement(
+                Vector(-float(padding) / 2.0, -stock_w / 2.0, -stock_h / 2.0),
+                FreeCAD.Rotation(),
+            )
 
         # Align X with strut axis, then rotate around X so Y aligns with radial projection.
         x_axis = Vector(axis_vec)
@@ -1249,8 +1781,105 @@ class StrutBuilder:
                     sign = 1.0 if radial_local.z >= 0 else -1.0
                     rotation = rotation.multiply(FreeCAD.Rotation(Vector(1, 0, 0), sign * angle * 180.0 / 3.141592653589793))
         base = FreeCAD.Placement(start, rotation)
-        box.Placement = base.multiply(center_offset)
-        return box
+        solid.Placement = base.multiply(center_offset)
+        return solid
+
+    def _compute_axis_rotation(self, axis_vec, midpoint_vec):
+        """Compute FreeCAD rotation that aligns X with strut axis and Y with radial."""
+        import FreeCAD  # type: ignore
+        from FreeCAD import Vector  # type: ignore
+
+        x_axis = Vector(axis_vec)
+        x_axis.normalize()
+        rotation = FreeCAD.Rotation(Vector(1, 0, 0), x_axis)
+        if midpoint_vec is not None:
+            radial = Vector(midpoint_vec)
+            if radial.Length > 0:
+                radial.normalize()
+                radial_local = rotation.inverted().multVec(radial)
+                radial_local = Vector(0, radial_local.y, radial_local.z)
+                if radial_local.Length > 0:
+                    radial_local.normalize()
+                    angle = Vector(0, 1, 0).getAngle(radial_local)
+                    sign = 1.0 if radial_local.z >= 0 else -1.0
+                    rotation = rotation.multiply(
+                        FreeCAD.Rotation(Vector(1, 0, 0), sign * angle * 180.0 / 3.141592653589793)
+                    )
+        return rotation
+
+    def _make_tapered_solid(
+        self,
+        length: float,
+        axis_vec,
+        start,
+        padding: float,
+        midpoint_vec,
+        cap_length: float,
+    ):
+        """Create a solid with tapered (conical) ends for tight node fitting.
+
+        The cross-section transitions from the full stock size to a reduced size
+        (``node_fit_taper_ratio`` × stock) over the ``cap_length`` region at each
+        end.  The body section retains full cross-section.  Ruled loft produces
+        flat CNC-cuttable taper surfaces.
+
+        Falls back to ``_make_aligned_box`` on loft failure or non-rectangular profile.
+        """
+        import FreeCAD  # type: ignore
+        import Part  # type: ignore
+        from FreeCAD import Vector  # type: ignore
+
+        profile = getattr(self.params, "strut_profile", "rectangular")
+        if profile != "rectangular":
+            # Taper only implemented for rectangular; fall back for round/trapezoidal.
+            return self._make_aligned_box(length, axis_vec, start, padding, midpoint_vec)
+
+        total_length = float(length + padding)
+        stock_w = float(self._fc_len(self.params.stock_width_m))
+        stock_h = float(self._fc_len(self.params.stock_height_m))
+        taper = float(getattr(self.params, "node_fit_taper_ratio", 0.6))
+        tw = stock_w * taper
+        th = stock_h * taper
+        pad_half = float(padding) / 2.0
+
+        # Clamp cap so the tapered regions don't overlap (keep ≥10% body).
+        eff_cap = min(float(cap_length), total_length * 0.45)
+
+        rotation = self._compute_axis_rotation(axis_vec, midpoint_vec)
+
+        def _rect_wire(x_pos: float, w: float, h: float):
+            hw, hh = w / 2.0, h / 2.0
+            pts = [
+                Vector(x_pos, -hw, -hh),
+                Vector(x_pos, hw, -hh),
+                Vector(x_pos, hw, hh),
+                Vector(x_pos, -hw, hh),
+                Vector(x_pos, -hw, -hh),
+            ]
+            return Part.makePolygon(pts)
+
+        # Four profile sections along the strut axis (local X).
+        x0 = -pad_half                              # start end (tapered)
+        x1 = -pad_half + eff_cap                    # start body (full)
+        x2 = -pad_half + total_length - eff_cap     # end body (full)
+        x3 = -pad_half + total_length               # end end (tapered)
+
+        wires = [
+            _rect_wire(x0, tw, th),
+            _rect_wire(x1, stock_w, stock_h),
+            _rect_wire(x2, stock_w, stock_h),
+            _rect_wire(x3, tw, th),
+        ]
+
+        try:
+            # ruled=True → flat CNC surfaces; solid=True → closed solid.
+            solid = Part.makeLoft(wires, True, True, False)
+        except Exception:
+            return self._make_aligned_box(length, axis_vec, start, padding, midpoint_vec)
+
+        base = FreeCAD.Placement(Vector(start), rotation)
+        solid.Placement = base
+        return solid
 
     def _cut_with_plane(self, shape, point, normal, keep_point, span):
         try:
