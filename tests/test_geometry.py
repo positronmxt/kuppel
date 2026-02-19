@@ -4522,3 +4522,151 @@ def test_multi_dome_plan_to_dict():
     # Must be JSON-serialisable
     text = json.dumps(d)
     assert "Main" in text
+
+
+# ---------------------------------------------------------------------------
+# Riser wall 3D solid creation
+# ---------------------------------------------------------------------------
+
+
+def test_riser_create_solids_exported():
+    """create_riser_wall_solids must be importable from riser_wall module."""
+    from freecad_dome.riser_wall import create_riser_wall_solids
+    assert callable(create_riser_wall_solids)
+
+
+def test_riser_create_solids_no_freecad():
+    """create_riser_wall_solids returns None when FreeCAD is missing."""
+    from freecad_dome.riser_wall import create_riser_wall_solids, plan_riser_wall
+
+    params = DomeParameters(
+        radius_m=5.0, frequency=2, generate_riser_wall=True,
+        riser_height_m=1.0, riser_thickness_m=0.15,
+    )
+    dome = tessellation.tessellate(
+        icosahedron.build_icosahedron(params.radius_m), params
+    )
+    plan = plan_riser_wall(dome, params)
+    result = create_riser_wall_solids(plan, params, document=None)
+    assert result is None  # FreeCAD not available in test env
+
+
+def test_riser_plan_has_required_geometry_fields():
+    """RiserWallPlan has all fields needed for 3D solid creation."""
+    from freecad_dome.riser_wall import plan_riser_wall
+
+    params = DomeParameters(
+        radius_m=5.0, frequency=2, generate_riser_wall=True,
+        riser_height_m=1.2, riser_thickness_m=0.15,
+    )
+    dome = tessellation.tessellate(
+        icosahedron.build_icosahedron(params.radius_m), params
+    )
+    plan = plan_riser_wall(dome, params)
+    assert plan.outer_radius_m > 0
+    assert plan.inner_radius_m > 0
+    assert plan.outer_radius_m > plan.inner_radius_m
+    assert plan.riser_height_m > 0
+    assert plan.riser_bottom_z_m < plan.riser_top_z_m
+
+
+def test_riser_plan_door_cutout_fields():
+    """Door cutout has required dimensions for 3D box subtraction."""
+    from freecad_dome.riser_wall import plan_riser_wall
+
+    params = DomeParameters(
+        radius_m=5.0, frequency=2, generate_riser_wall=True,
+        riser_height_m=1.2, riser_thickness_m=0.15,
+        riser_door_integration=True,
+        generate_base_wall=True,
+        door_width_m=0.9, door_height_m=2.1,
+        door_angle_deg=45.0,
+    )
+    dome = tessellation.tessellate(
+        icosahedron.build_icosahedron(params.radius_m), params
+    )
+    plan = plan_riser_wall(dome, params)
+    assert plan.door_cutout is not None
+    assert plan.door_cutout.door_width_m > 0
+    assert plan.door_cutout.door_height_m > 0
+
+
+def test_riser_pipeline_step_imports_create_solids():
+    """Pipeline RiserWallStep must import create_riser_wall_solids."""
+    src = inspect.getsource(pipeline.RiserWallStep)
+    assert "create_riser_wall_solids" in src
+
+
+# ---------------------------------------------------------------------------
+# Skylight 3D solid creation
+# ---------------------------------------------------------------------------
+
+
+def test_skylight_create_solids_exported():
+    """create_skylight_solids must be importable from skylight module."""
+    from freecad_dome.skylight import create_skylight_solids
+    assert callable(create_skylight_solids)
+
+
+def test_skylight_create_solids_no_freecad():
+    """create_skylight_solids returns None when FreeCAD is missing."""
+    from freecad_dome.skylight import create_skylight_solids, plan_skylights
+
+    params = DomeParameters(
+        radius_m=5.0, frequency=2, generate_skylights=True,
+        skylight_count=2, skylight_position="apex",
+    )
+    dome = tessellation.tessellate(
+        icosahedron.build_icosahedron(params.radius_m), params
+    )
+    plan = plan_skylights(dome, params)
+    result = create_skylight_solids(plan, dome, document=None)
+    assert result is None  # FreeCAD not available in test env
+
+
+def test_skylight_plan_panels_have_vertices():
+    """SkylightPanel must have enough data for 3D polygon creation."""
+    from freecad_dome.skylight import plan_skylights
+
+    params = DomeParameters(
+        radius_m=5.0, frequency=2, generate_skylights=True,
+        skylight_count=2, skylight_position="apex",
+    )
+    dome = tessellation.tessellate(
+        icosahedron.build_icosahedron(params.radius_m), params
+    )
+    plan = plan_skylights(dome, params)
+    assert len(plan.skylights) >= 1
+    for sk in plan.skylights:
+        pidx = sk.panel_index
+        assert 0 <= pidx < len(dome.panels)
+        panel = dome.panels[pidx]
+        pts = [dome.nodes[i] for i in panel.node_indices]
+        assert len(pts) >= 3
+        assert sk.glass_thickness_m > 0
+        assert sk.frame_width_m > 0
+        # open_direction must be a non-zero vector
+        nx, ny, nz = sk.open_direction
+        assert abs(nx) + abs(ny) + abs(nz) > 1e-6
+
+
+def test_skylight_pipeline_step_imports_create_solids():
+    """Pipeline SkylightStep must import create_skylight_solids."""
+    src = inspect.getsource(pipeline.SkylightStep)
+    assert "create_skylight_solids" in src
+
+
+def test_skylight_create_solids_empty_plan():
+    """create_skylight_solids returns None for a plan with no skylights."""
+    from freecad_dome.skylight import SkylightPlan, create_skylight_solids
+
+    params = DomeParameters(radius_m=5.0, frequency=2)
+    dome = tessellation.tessellate(
+        icosahedron.build_icosahedron(params.radius_m), params
+    )
+    empty_plan = SkylightPlan(
+        skylights=[], total_skylight_area_m2=0.0,
+        dome_surface_area_m2=10.0, skylight_ratio=0.0,
+    )
+    result = create_skylight_solids(empty_plan, dome, document=None)
+    assert result is None

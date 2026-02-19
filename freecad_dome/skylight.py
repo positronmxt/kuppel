@@ -33,6 +33,7 @@ __all__ = [
     "select_apex_skylights",
     "select_ring_skylights",
     "write_skylight_report",
+    "create_skylight_solids",
 ]
 
 
@@ -224,6 +225,179 @@ def write_skylight_report(plan: SkylightPlan, out_dir: Path) -> Path:
     path.write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")
     logging.info("Wrote skylight plan %s", path)
     return path
+
+
+# ---------------------------------------------------------------------------
+# FreeCAD 3-D geometry
+# ---------------------------------------------------------------------------
+
+_FC_SCALE: float = 1000.0  # metres → mm
+
+
+def create_skylight_solids(
+    plan: SkylightPlan,
+    dome: TessellatedDome,
+    document: Any = None,
+) -> Optional[Any]:
+    """Create FreeCAD Part::Feature solids for each skylight panel.
+
+    For every :class:`SkylightPanel` in *plan*, creates:
+
+    - A **glass pane** — the panel face extruded inward by
+      ``glass_thickness_m``.
+    - A **frame** — the panel outline extruded by the same thickness,
+      offset inward by ``frame_width_m``, producing a border ring.
+
+    All objects are placed under an ``App::DocumentObjectGroup`` named
+    ``"Skylights"``.
+
+    Parameters
+    ----------
+    plan : SkylightPlan
+        Output of :func:`plan_skylights`.
+    dome : TessellatedDome
+        The tessellated dome (needed for panel vertex coordinates).
+    document : optional
+        Existing FreeCAD document.
+
+    Returns
+    -------
+    The FreeCAD group object, or *None* on failure.
+    """
+    try:
+        import FreeCAD  # type: ignore
+        import Part  # type: ignore
+        from FreeCAD import Vector  # type: ignore
+    except ImportError:
+        return None
+
+    doc = document
+    if doc is None:
+        doc = FreeCAD.ActiveDocument
+    if doc is None:
+        doc = FreeCAD.newDocument("GeodesicDome")
+
+    def _mm(m: float) -> float:
+        return float(m) * _FC_SCALE
+
+    created: list[Any] = []
+
+    _MATERIAL_COLORS: Dict[str, tuple] = {
+        "glass":         (0.40, 0.70, 0.90, 0.0),
+        "polycarbonate": (0.85, 0.88, 0.75, 0.0),
+    }
+    _FRAME_COLOR = (0.25, 0.25, 0.25, 0.0)
+
+    for sk in plan.skylights:
+        pidx = sk.panel_index
+        if pidx < 0 or pidx >= len(dome.panels):
+            continue
+        panel = dome.panels[pidx]
+        pts = [dome.nodes[i] for i in panel.node_indices]
+        if len(pts) < 3:
+            continue
+
+        # Convert to FreeCAD vectors (mm) ------------------------------------
+        fc_pts = [Vector(_mm(p[0]), _mm(p[1]), _mm(p[2])) for p in pts]
+
+        # Panel normal (outward)
+        nx, ny, nz = sk.open_direction
+        norm_vec = Vector(nx, ny, nz)
+        norm_len = norm_vec.Length
+        if norm_len < 1e-12:
+            continue
+        norm_vec = norm_vec * (1.0 / norm_len)
+
+        thickness = _mm(sk.glass_thickness_m) if sk.glass_thickness_m > 0 else 6.0
+
+        # --- Glass pane (full panel face extruded inward) -------------------
+        try:
+            wire_pts = list(fc_pts) + [fc_pts[0]]
+            wire = Part.makePolygon(wire_pts)
+            face = Part.Face(wire)
+            glass_solid = face.extrude(norm_vec * (-thickness))
+
+            g_obj = doc.addObject("Part::Feature", f"SkylightGlass_{pidx:03d}")
+            g_obj.Label = f"SkylightGlass_{pidx:03d}"
+            g_obj.Shape = glass_solid
+            color = _MATERIAL_COLORS.get(sk.material, (0.40, 0.70, 0.90, 0.0))
+            try:
+                g_obj.ViewObject.ShapeColor = color
+                g_obj.ViewObject.Transparency = 50
+            except Exception:
+                pass
+            created.append(g_obj)
+        except Exception as exc:
+            logging.warning("Skylight glass %d failed: %s", pidx, exc)
+
+        # --- Frame ring (panel outline minus inner offset) ------------------
+        frame_w = _mm(sk.frame_width_m) if sk.frame_width_m > 0 else _mm(0.05)
+        try:
+            # Compute centroid
+            cx = sum(v.x for v in fc_pts) / len(fc_pts)
+            cy = sum(v.y for v in fc_pts) / len(fc_pts)
+            cz = sum(v.z for v in fc_pts) / len(fc_pts)
+            c = Vector(cx, cy, cz)
+
+            # Scale inward for inner wire
+            inner_pts: list[Any] = []
+            for v in fc_pts:
+                diff = v - c
+                edge_len = diff.Length
+                if edge_len < 1e-6:
+                    inner_pts.append(v)
+                else:
+                    shrink = max(0.0, 1.0 - frame_w / edge_len)
+                    inner_pts.append(c + diff * shrink)
+
+            outer_wire = Part.makePolygon(list(fc_pts) + [fc_pts[0]])
+            inner_wire = Part.makePolygon(list(inner_pts) + [inner_pts[0]])
+
+            outer_face = Part.Face(outer_wire)
+            inner_face = Part.Face(inner_wire)
+            frame_face = outer_face.cut(inner_face)
+
+            frame_solid = frame_face.extrude(norm_vec * (-thickness))
+
+            f_obj = doc.addObject("Part::Feature", f"SkylightFrame_{pidx:03d}")
+            f_obj.Label = f"SkylightFrame_{pidx:03d}"
+            f_obj.Shape = frame_solid
+            try:
+                f_obj.ViewObject.ShapeColor = _FRAME_COLOR
+            except Exception:
+                pass
+            created.append(f_obj)
+        except Exception as exc:
+            logging.warning("Skylight frame %d failed: %s", pidx, exc)
+
+    if not created:
+        return None
+
+    # Group all under "Skylights" -----------------------------------------------
+    grp = None
+    try:
+        for o in list(getattr(doc, "Objects", []) or []):
+            if (
+                str(getattr(o, "Name", "")) == "Skylights_Group"
+                and str(getattr(o, "TypeId", "")) == "App::DocumentObjectGroup"
+            ):
+                grp = o
+                break
+        if grp is None:
+            grp = doc.addObject("App::DocumentObjectGroup", "Skylights_Group")
+            grp.Label = "Skylights"
+        for co in created:
+            grp.addObject(co)
+    except Exception:
+        pass
+
+    try:
+        doc.recompute()
+    except Exception:
+        pass
+
+    logging.info("Created skylight solids: %d objects", len(created))
+    return grp
 
 
 # ---------------------------------------------------------------------------

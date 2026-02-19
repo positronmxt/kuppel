@@ -223,7 +223,7 @@ class BaseWallStep(PipelineStep):
 
 
 class RiserWallStep(PipelineStep):
-    """Plan riser wall (pikendusring) geometry and write report."""
+    """Plan riser wall (pikendusring) geometry, write report, and create 3D solids."""
 
     name = "riser_wall"
 
@@ -231,15 +231,23 @@ class RiserWallStep(PipelineStep):
         return ctx.params.generate_riser_wall and ctx.dome is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        from .riser_wall import plan_riser_wall, write_riser_report
+        from .riser_wall import create_riser_wall_solids, plan_riser_wall, write_riser_report
 
         try:
             plan = plan_riser_wall(ctx.dome, ctx.params)
             ctx.riser_wall_plan = plan  # type: ignore[attr-defined]
             logging.info("Riser wall plan: %s", plan.summary())
             write_riser_report(plan, ctx.out_dir)
+
+            # Create FreeCAD 3-D solids
+            grp = create_riser_wall_solids(plan, ctx.params, document=ctx.document)
+            if grp is not None:
+                ctx._set_document_if_missing(
+                    getattr(grp, "Document", None)
+                )
+                logging.info("Riser wall 3D solids created")
         except Exception as exc:
-            logging.warning("Riser wall planning failed: %s", exc)
+            logging.warning("Riser wall generation failed: %s", exc)
 
 
 class StrutGenerationStep(PipelineStep):
@@ -428,7 +436,7 @@ class VentilationStep(PipelineStep):
 
 
 class SkylightStep(PipelineStep):
-    """Plan skylight / window layout and write report."""
+    """Plan skylight / window layout, write report, and create 3D solids."""
 
     name = "skylights"
 
@@ -436,15 +444,23 @@ class SkylightStep(PipelineStep):
         return ctx.params.generate_skylights and ctx.dome is not None
 
     def execute(self, ctx: PipelineContext) -> None:
-        from .skylight import plan_skylights, write_skylight_report
+        from .skylight import create_skylight_solids, plan_skylights, write_skylight_report
 
         try:
             plan = plan_skylights(ctx.dome, ctx.params)
             ctx.skylight_plan = plan  # type: ignore[attr-defined]
             logging.info("Skylight plan: %s", plan.summary())
             write_skylight_report(plan, ctx.out_dir)
+
+            # Create FreeCAD 3-D solids
+            grp = create_skylight_solids(plan, ctx.dome, document=ctx.document)
+            if grp is not None:
+                ctx._set_document_if_missing(
+                    getattr(grp, "Document", None)
+                )
+                logging.info("Skylight 3D solids created")
         except Exception as exc:
-            logging.warning("Skylight planning failed: %s", exc)
+            logging.warning("Skylight generation failed: %s", exc)
 
 
 class CoveringReportStep(PipelineStep):

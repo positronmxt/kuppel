@@ -40,6 +40,7 @@ __all__ = [
     "RiserStud",
     "plan_riser_wall",
     "write_riser_report",
+    "create_riser_wall_solids",
 ]
 
 log = logging.getLogger(__name__)
@@ -275,6 +276,181 @@ def write_riser_report(plan: RiserWallPlan, out_dir: Path) -> Path:
     path.write_text(json.dumps(plan.to_dict(), indent=2), encoding="utf-8")
     log.info("Wrote riser wall plan %s", path)
     return path
+
+
+# ---------------------------------------------------------------------------
+# FreeCAD 3-D geometry
+# ---------------------------------------------------------------------------
+
+_FC_SCALE: float = 1000.0  # metres → mm
+
+
+def create_riser_wall_solids(
+    plan: RiserWallPlan,
+    params: DomeParameters,
+    document: Any = None,
+) -> Optional[Any]:
+    """Create FreeCAD Part::Feature solids for the riser wall.
+
+    Creates a hollow cylindrical wall with optional door cutout and optional
+    stud geometry for wood-frame risers.  All objects are placed under an
+    ``App::DocumentObjectGroup`` named ``"RiserWall"``.
+
+    Parameters
+    ----------
+    plan : RiserWallPlan
+        Output of :func:`plan_riser_wall`.
+    params : DomeParameters
+        Dome parameters (used for door dimensions).
+    document : optional
+        Existing FreeCAD document.  If *None*, uses ``FreeCAD.ActiveDocument``
+        or creates a new one.
+
+    Returns
+    -------
+    The FreeCAD group object, or *None* on failure / missing FreeCAD.
+    """
+    try:
+        import FreeCAD  # type: ignore
+        import Part  # type: ignore
+        from FreeCAD import Vector  # type: ignore
+    except ImportError:
+        return None
+
+    doc = document
+    if doc is None:
+        doc = FreeCAD.ActiveDocument
+    if doc is None:
+        doc = FreeCAD.newDocument("GeodesicDome")
+
+    def _mm(m: float) -> float:
+        return float(m) * _FC_SCALE
+
+    outer_r = _mm(plan.outer_radius_m)
+    inner_r = _mm(plan.inner_radius_m)
+    h = _mm(plan.riser_height_m)
+
+    if outer_r <= 0 or inner_r <= 0 or h <= 0:
+        return None
+
+    # Hollow cylindrical shell --------------------------------------------------
+    outer = Part.makeCylinder(outer_r, h)
+    inner = Part.makeCylinder(inner_r, h)
+    shell = outer.cut(inner)
+
+    # Door cutout ---------------------------------------------------------------
+    if plan.door_cutout is not None:
+        dc = plan.door_cutout
+        door_w = _mm(dc.door_width_m)
+        door_h = _mm(min(dc.door_height_m, plan.riser_height_m))
+        door_clear = _mm(getattr(params, "door_clearance_m", 0.005))
+        door_w = max(1.0, door_w + door_clear * 2.0)
+        door_h = max(1.0, door_h + door_clear * 2.0)
+
+        wall_t = _mm(plan.riser_thickness_m)
+        radial_len = wall_t * 4.0
+
+        x0 = inner_r - wall_t  # extend past inner face
+        y0 = -door_w / 2.0
+        z0 = 0.0
+
+        door_box = Part.makeBox(radial_len, door_w, door_h)
+        door_box.Placement = FreeCAD.Placement(
+            Vector(x0, y0, z0), FreeCAD.Rotation()
+        )
+
+        ang_deg = float(dc.door_angle_deg)
+        rot = FreeCAD.Rotation(Vector(0, 0, 1), ang_deg)
+        door_box.Placement = FreeCAD.Placement(
+            Vector(0, 0, 0), rot
+        ).multiply(door_box.Placement)
+
+        shell = shell.cut(door_box)
+
+    # Translate shell to correct Z position ------------------------------------
+    bottom_z = _mm(plan.riser_bottom_z_m)
+    shell.Placement = FreeCAD.Placement(
+        Vector(0.0, 0.0, bottom_z), FreeCAD.Rotation()
+    )
+
+    # Add to document ----------------------------------------------------------
+    obj = doc.addObject("Part::Feature", "RiserWall")
+    obj.Label = "RiserWall"
+    obj.Shape = shell
+
+    try:
+        if hasattr(obj, "addProperty") and not hasattr(obj, "IfcType"):
+            obj.addProperty("App::PropertyString", "IfcType", "BIM", "IFC type")
+        if hasattr(obj, "IfcType"):
+            obj.IfcType = "IfcWall"
+    except Exception:
+        pass
+
+    # Visual appearance --------------------------------------------------------
+    _MATERIAL_COLORS = {
+        "concrete": (0.75, 0.75, 0.72, 0.0),
+        "wood":     (0.82, 0.63, 0.35, 0.0),
+        "steel":    (0.60, 0.62, 0.65, 0.0),
+    }
+    try:
+        color = _MATERIAL_COLORS.get(plan.material, (0.75, 0.75, 0.72, 0.0))
+        obj.ViewObject.ShapeColor = color
+    except Exception:
+        pass
+
+    created_objects: List[Any] = [obj]
+
+    # Studs for wood-frame riser -----------------------------------------------
+    if plan.studs:
+        stud_w = _mm(max(plan.riser_thickness_m * 0.3, 0.038))  # typical 38 mm
+        stud_d = _mm(max(plan.riser_thickness_m * 0.6, 0.089))  # typical 89 mm
+        for i, stud in enumerate(plan.studs):
+            s_len = _mm(stud.length_m)
+            if s_len <= 0:
+                continue
+            s_box = Part.makeBox(stud_d, stud_w, s_len)
+            sx = _mm(stud.x_bottom_m) - stud_d / 2.0
+            sy = _mm(stud.y_bottom_m) - stud_w / 2.0
+            sz = _mm(stud.z_bottom_m)
+            az_rad = math.radians(stud.azimuth_deg)
+            s_box.Placement = FreeCAD.Placement(
+                Vector(sx, sy, sz),
+                FreeCAD.Rotation(Vector(0, 0, 1), stud.azimuth_deg),
+            )
+            s_obj = doc.addObject("Part::Feature", f"RiserStud_{i:03d}")
+            s_obj.Label = f"RiserStud_{i:03d}"
+            s_obj.Shape = s_box
+            try:
+                s_obj.ViewObject.ShapeColor = (0.82, 0.63, 0.35, 0.0)
+            except Exception:
+                pass
+            created_objects.append(s_obj)
+
+    # Group all objects --------------------------------------------------------
+    grp = None
+    try:
+        for o in list(getattr(doc, "Objects", []) or []):
+            if (
+                str(getattr(o, "Name", "")) == "RiserWall_Group"
+                and str(getattr(o, "TypeId", "")) == "App::DocumentObjectGroup"
+            ):
+                grp = o
+                break
+        if grp is None:
+            grp = doc.addObject("App::DocumentObjectGroup", "RiserWall_Group")
+            grp.Label = "RiserWall"
+        for co in created_objects:
+            grp.addObject(co)
+    except Exception:
+        pass
+
+    try:
+        doc.recompute()
+    except Exception:
+        pass
+
+    log.info("Created riser wall solids: %d objects", len(created_objects))
+    return grp
 
 
 # ---------------------------------------------------------------------------
